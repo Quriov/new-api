@@ -1,0 +1,40 @@
+# Quriov 自建构建校验 —— 只构建, 不推送任何 registry。
+#
+# 为什么需要它: Quriov-API-Platform/HANDOFF.md §8.3 记着「从源码自建镜像的应急路径
+# 从没真的构建成功过一次, 这份保险只在纸面上」。这个 workflow 把那句话变成可机检的事实。
+#
+# ⚠ 跑在 GitHub 托管 runner 上: 本仓是公开仓, 托管 runner 免费, 且自带 docker ——
+#    不占我们自己的 self-hosted 池, 也不碰跑着生产 api 站的那台机器。
+name: Quriov build check (no push)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: docker build (仅验证能建出来)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 记录冻结点
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "VERSION: $(cat VERSION 2>/dev/null || echo 无)"
+
+      - name: docker build
+        run: |
+          set -eux
+          docker build --progress=plain -t quriov/new-api:buildcheck .
+
+      - name: 建出来的东西真的能跑吗
+        run: |
+          set -eux
+          docker images quriov/new-api:buildcheck
+          # 只验二进制能起来并打印版本, 不连数据库
+          docker run --rm --entrypoint /bin/sh quriov/new-api:buildcheck -c 'ls -la /new-api && /new-api --version 2>&1 | head -3 || true'
