@@ -110,6 +110,15 @@ type TaskPrivateData struct {
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+
+	// ── 任务失败后换渠道重投（Quriov 改造）────────────────────────────
+	// ⚠ 这几个字段只能用【可比较】类型（string/int）：TaskPrivateData.Value()
+	//   用的是结构体 == 比较，加任何切片/映射字段会直接编译不过。
+	ResubmitBodyB64     string `json:"resubmit_body_b64,omitempty"`     // 原始请求体(base64)，重投时原样发给新渠道
+	ResubmitContentType string `json:"resubmit_content_type,omitempty"` // 原始 Content-Type
+	ResubmitPath        string `json:"resubmit_path,omitempty"`         // 原始请求路径
+	TriedChannels       string `json:"tried_channels,omitempty"`        // 试过的渠道 ID，逗号分隔，含首次提交那个
+	ResubmitCount       int    `json:"resubmit_count,omitempty"`        // 已经重投了几次
 }
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。

@@ -601,6 +601,12 @@ func RelayTask(c *gin.Context) {
 		task.Quota = result.Quota
 		task.Data = result.TaskData
 		task.Action = relayInfo.Action
+		// Quriov 改造：留存原始请求，供任务在上游侧失败后换渠道重投。
+		// 不留存也能正常工作，只是那个任务失去了换腿的能力（会在日志里说明）。
+		if constant.TaskResubmitEnabled {
+			task.MarkChannelTried(channelIDForResubmit(c))
+			recordResubmitPayload(c, task)
+		}
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
 		}
