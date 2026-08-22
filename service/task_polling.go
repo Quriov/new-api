@@ -521,6 +521,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	shouldRefund := false
 	shouldSettle := false
+	resubmitted := false
 	quota := task.Quota
 
 	task.Status = model.TaskStatus(taskResult.Status)
@@ -552,6 +553,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		shouldSettle = true
 	case model.TaskStatusFailure:
 		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
+		// Quriov 改造：上游把任务收下之后才失败的这一类，原本到这里就是终态。
+		// 先看看能不能换一个还没试过的渠道把原始请求重投一次；
+		// 重投成功的任务【不进终态、也不退款】——它还活着，下一轮轮询继续跟。
+		if TryResubmitTaskOnAnotherChannel(ctx, task, taskResult.Reason) {
+			resubmitted = true
+			break
+		}
 		task.Status = model.TaskStatusFailure
 		task.Progress = taskcommon.ProgressComplete
 		if task.FinishTime == 0 {
@@ -566,8 +574,22 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	default:
 		return fmt.Errorf("unknown task status %s for task %s", taskResult.Status, task.TaskID)
 	}
-	if taskResult.Progress != "" {
+	if taskResult.Progress != "" && !resubmitted {
 		task.Progress = taskResult.Progress
+	}
+
+	if resubmitted {
+		// 重投改掉的是 channel_id 和上游任务 ID，这两个字段都【不在】 taskSnapshot
+		// 的比较范围里（它只比 status/progress/时间/失败原因/结果 URL/data）。
+		// 走下面那套「有没有变化才写」的判断会把它们漏掉，所以这里必须强制落一次库。
+		// ⚠ 请求已经发给新上游了才走到这——CAS 如果输了，那个上游任务会成为孤儿。
+		//   轮询由系统任务租约保证单实例执行，正常不会发生；真发生了下面这条日志能看见。
+		if won, err := task.UpdateWithStatus(snap.Status); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("任务 %s 重投后落库失败：%s（上游新任务可能成为孤儿）", task.TaskID, err.Error()))
+		} else if !won {
+			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 重投后 CAS 落库未命中，说明有别的进程同时改了它（上游新任务可能成为孤儿）", task.TaskID))
+		}
+		return nil
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure

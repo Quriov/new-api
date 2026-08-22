@@ -143,6 +143,10 @@ func main() {
 		return a
 	}
 
+	// Wire task resubmit executor (Quriov 改造: 任务失败后换渠道重投).
+	// 同样是为了不破坏 service -> relay/controller 的依赖方向。
+	service.ResubmitTaskFunc = controller.ResubmitTaskOnChannel
+
 	// Register the periodic channel test, upstream model update, and async task
 	// polling (Midjourney / Suno / video) jobs as scheduled system tasks
 	// (DB-lease dedup across masters + run history), then start the runner that
