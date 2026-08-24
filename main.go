@@ -59,6 +59,21 @@ func main() {
 	}
 
 	common.SysLog("New API " + common.Version + " started")
+
+	// Quriov 改造: 把「任务失败换渠道重投」的配置在启动时打出来。
+	//
+	// 为什么值得占一行启动日志: 这个功能默认开、且平时完全静默 ——
+	// 一切正常时它不做任何事, 被关掉时它也不做任何事, **两种情况长得一模一样**。
+	// 没有这行日志, 运维想确认"它到底在不在起作用"只能去翻源码或猜环境变量,
+	// 而"代码写好了但没被分发/没被打开"恰恰是最难发现的那种空转。
+	if constant.TaskResubmitEnabled {
+		common.SysLog(fmt.Sprintf(
+			"quriov: 任务失败换渠道重投 已启用 (最多重投 %d 次, 请求体留存上限 %dKB, 不重投的失败原因 %d 条)",
+			constant.TaskResubmitMaxAttempts, constant.TaskResubmitMaxBodyKB, len(constant.TaskResubmitSkipReasons)))
+	} else {
+		common.SysLog("quriov: 任务失败换渠道重投 已【关闭】 (TASK_RESUBMIT_ENABLED=false) — 上游收下任务后才失败的那一类将没有任何兜底")
+	}
+
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
 	}

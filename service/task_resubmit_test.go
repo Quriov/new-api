@@ -341,3 +341,77 @@ func TestResubmitPayload_SurvivesBinaryBody(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, binary, got)
 }
+
+// ── 线上真实失败原因的回归样本 ────────────────────────────────────────
+
+// TestDecideResubmit_AgainstRealProductionFailureReasons 把 api 站 2026-08-21～24
+// 四天里【真实出现过的每一种】fail_reason 钉在这里, 逐条断言该不该重投。
+//
+// 为什么值得单独一条: 跳过清单是靠子串匹配人类文字的, 上游随时可能换措辞。
+// 用真实样本钉住, 比自己编几个字符串靠谱得多 —— 编的那些永远会通过。
+func TestDecideResubmit_AgainstRealProductionFailureReasons(t *testing.T) {
+	setupResubmitTest(t)
+	//: 换成默认清单(而不是 setup 里那份精简版), 因为这条测的就是默认清单够不够用。
+	constant.TaskResubmitSkipReasons = []string{
+		"没有按照预期生成图片", "内容审核", "违规内容", "敏感内容",
+		"content_policy", "content policy", "safety system", "prompt was rejected",
+	}
+
+	cases := []struct {
+		reason string
+		want   bool
+		why    string
+	}{
+		{"没有按照预期生成图片，请重新调整提示词后重试", false,
+			"23 次 — 提示词/内容被拒, 换家上游一样拒"},
+		{"已生成的图片可能含违规内容，被内容审核系统拦截，请修改提示词后重试", false,
+			"1 次 — 内容审核。⚠ 措辞跟上面那条完全不同, 靠的是「违规内容」和「内容审核」两个子串"},
+		{"Internet Error，请耐心等待！", true,
+			"14 次 — 上游侧瞬时错误, 正是换腿能救的"},
+		{"exit", true,
+			"14 次 — 实查 data 字段是 {\"code\":\"upstream_error\",\"message\":\"exit\"}, " +
+				"全部集中在 8/21 那天的故障窗口。是上游错误不是内容拒绝, 必须重投"},
+	}
+
+	for _, c := range cases {
+		got := DecideResubmit(newFailedTask(2), c.reason).ShouldResubmit
+		if got != c.want {
+			t.Errorf("失败原因 %q\n  期望%s, 实际%s\n  依据: %s",
+				c.reason,
+				map[bool]string{true: "重投", false: "不重投"}[c.want],
+				map[bool]string{true: "重投", false: "不重投"}[got],
+				c.why)
+		}
+	}
+}
+
+// TestSkipReasons_DefaultListIsNotAllOrNothing 反向断言: 默认清单必须是【有取舍】的。
+//
+// 没有这条的话, 有人把清单清空(全都重投)或者加一条 "" / "e" 这种能匹配一切的
+// (全都不重投), 上面那条测试里的四条会集体倒向同一边 —— 而"全都重投"和"全都不重投"
+// 各自都能让一半用例通过, 看起来像只是判据不够准, 而不是清单坏了。
+func TestSkipReasons_DefaultListIsNotAllOrNothing(t *testing.T) {
+	setupResubmitTest(t)
+	constant.TaskResubmitSkipReasons = []string{
+		"没有按照预期生成图片", "内容审核", "违规内容", "敏感内容",
+		"content_policy", "content policy", "safety system", "prompt was rejected",
+	}
+	task := newFailedTask(2)
+	skipped, retried := 0, 0
+	for _, r := range []string{
+		"没有按照预期生成图片，请重新调整提示词后重试",
+		"已生成的图片可能含违规内容，被内容审核系统拦截，请修改提示词后重试",
+		"Internet Error，请耐心等待！",
+		"exit",
+	} {
+		if DecideResubmit(task, r).ShouldResubmit {
+			retried++
+		} else {
+			skipped++
+		}
+	}
+	if skipped == 0 || retried == 0 {
+		t.Fatalf("默认清单变成一刀切了: 跳过 %d 条 / 重投 %d 条 —— "+
+			"两边都必须有, 否则清单不是清空了就是加了能匹配一切的模式", skipped, retried)
+	}
+}
