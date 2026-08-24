@@ -1,7 +1,11 @@
-# Quriov 自建构建校验 —— 只构建, 不推送任何 registry。
+# Quriov 自建构建校验 —— 只构建 + 真跑一遍, 不推送任何 registry。
 #
 # 为什么需要它: Quriov-API-Platform/HANDOFF.md §8.3 记着「从源码自建镜像的应急路径
 # 从没真的构建成功过一次, 这份保险只在纸面上」。这个 workflow 把那句话变成可机检的事实。
+#
+# ⚠ 2026-08-24 扩了一步: 原来只验「二进制存在且可执行」, 那证明不了这个镜像
+#    **能替换生产镜像**。现在真起容器、真连 MySQL(跟生产同一种库)、真打接口。
+#    「建得出来」和「跑得起来」是两件事, 之前只验了前一件。
 #
 # ⚠ 跑在 GitHub 托管 runner 上: 本仓是公开仓, 托管 runner 免费, 且自带 docker ——
 #    不占我们自己的 self-hosted 池, 也不碰跑着生产 api 站的那台机器。
@@ -9,14 +13,31 @@ name: Quriov build check (no push)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [quriov]
+  pull_request:
+    branches: [quriov]
 
 jobs:
   build:
-    name: docker build (仅验证能建出来)
+    name: docker build + 真跑一遍
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
+
+    services:
+      mysql:
+        # 跟生产 api 站同一种库 —— 用 SQLite 跑绿是另一回事, 证明不了生产能换。
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: buildcheck
+          MYSQL_DATABASE: newapi
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pbuildcheck"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,9 +53,82 @@ jobs:
           set -eux
           docker build --progress=plain -t quriov/new-api:buildcheck .
 
-      - name: 建出来的东西真的能跑吗
+      - name: 二进制存在且可执行
         run: |
           set -eux
           docker images quriov/new-api:buildcheck
-          # 只验二进制能起来并打印版本, 不连数据库
-          docker run --rm --entrypoint /bin/sh quriov/new-api:buildcheck -c 'ls -la /new-api && /new-api --version 2>&1 | head -3 || true'
+          docker run --rm --entrypoint /bin/sh quriov/new-api:buildcheck -c 'ls -la /new-api && test -x /new-api'
+
+      # ── 到这里为止是老的验证范围。下面是 2026-08-24 补的「真跑一遍」。──
+
+      - name: 起容器 · 连 MySQL
+        run: |
+          set -eux
+          docker run -d --name newapi-check --network host \
+            -e SQL_DSN='root:buildcheck@tcp(127.0.0.1:3306)/newapi' \
+            -e PORT=3000 \
+            -e TZ=Asia/Shanghai \
+            quriov/new-api:buildcheck
+          # 建表 + 起 HTTP 要一点时间, 轮询而不是死等一个固定秒数。
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:3000/api/status >/dev/null 2>&1; then
+              echo "第 ${i} 次探测起来了"; break
+            fi
+            if ! docker ps --filter name=newapi-check --filter status=running -q | grep -q .; then
+              echo "::error::容器已经退出了"; docker logs newapi-check | tail -80; exit 1
+            fi
+            sleep 2
+          done
+
+      - name: 接口真的能应答
+        run: |
+          set -eux
+          BODY=$(curl -fsS --max-time 10 http://127.0.0.1:3000/api/status)
+          echo "$BODY"
+          # 判据要能为假: 光看 HTTP 200 不够 —— 反代/兜底页也会给 200。
+          echo "$BODY" | grep -q '"success":true' \
+            || { echo "::error::/api/status 回的不是 new-api 的成功响应"; exit 1; }
+
+      - name: 数据库真的被建起来了
+        run: |
+          set -eux
+          # 空跑不连库也能给 200 —— 必须确认它真往库里写了东西。
+          TABLES=$(docker run --rm --network host mysql:8.0 \
+            mysql -h127.0.0.1 -uroot -pbuildcheck -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='newapi';" 2>/dev/null)
+          echo "newapi 库里有 ${TABLES} 张表"
+          [ "$TABLES" -gt 10 ] || { echo "::error::表建少了(${TABLES}), 说明它没真连上库"; exit 1; }
+          # tasks 表必须有 private_data 列 —— 换渠道重投的留存字段住在里面。
+          docker run --rm --network host mysql:8.0 \
+            mysql -h127.0.0.1 -uroot -pbuildcheck -N -e "SHOW COLUMNS FROM newapi.tasks LIKE 'private_data';" 2>/dev/null | grep -q private_data \
+            || { echo "::error::tasks 表没有 private_data 列"; exit 1; }
+
+      - name: 换渠道重投这个开关在跑起来的镜像里【真的是开的】
+        run: |
+          set -eux
+          # 为什么要单独验这条: 这个功能平时完全静默 —— 开着不做事、关着也不做事,
+          # 两种情况长得一模一样。「代码合进去了」不等于「它在起作用」。
+          docker logs newapi-check 2>&1 | grep -q 'quriov: 任务失败换渠道重投 已启用' \
+            || { echo "::error::启动日志里没有那行 —— 要么开关是关的, 要么这个镜像根本不含本次改造";
+                 docker logs newapi-check 2>&1 | grep -i quriov || true; exit 1; }
+
+      - name: 反向验证 · 关掉开关时日志必须变
+        run: |
+          set -eux
+          # 上一步的判据必须能为假, 否则它跟「一切正常」长得一样。
+          docker run --rm --network host \
+            -e SQL_DSN='root:buildcheck@tcp(127.0.0.1:3306)/newapi' \
+            -e PORT=3001 -e TASK_RESUBMIT_ENABLED=false \
+            --name newapi-check-off quriov/new-api:buildcheck > /tmp/off.log 2>&1 &
+          for i in $(seq 1 45); do grep -q 'quriov: 任务失败换渠道重投' /tmp/off.log && break; sleep 2; done
+          cat /tmp/off.log | grep -i quriov || true
+          grep -q '已【关闭】' /tmp/off.log \
+            || { echo "::error::把开关关掉之后日志没变 —— 上一步那条判据是恒真的"; exit 1; }
+          docker rm -f newapi-check-off 2>/dev/null || true
+
+      - name: 出问题时把日志留下
+        if: always()
+        run: docker logs newapi-check 2>&1 | tail -120 || true
+
+      - name: 收摊
+        if: always()
+        run: docker rm -f newapi-check newapi-check-off 2>/dev/null || true
