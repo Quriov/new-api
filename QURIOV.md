@@ -117,11 +117,18 @@ ORDER BY created_at DESC LIMIT 20;
   - **对正常路由完全不可见** —— 客户首次请求发给它必然失败，让它进正常路由 = 主动制造故障
   - 只在「任务失败后换渠道重投」时被单独挑出来，且**排在所有异步渠道之后**
     （先试便宜的，实在没得换才上要阻塞几十秒的它）
-- 协议转换：异步任务的请求体 → chat/completions 的 `{messages:[{content:[图..., 文字]}]}`
-  - 图在前文字在后（跟主站那条已验证的调法一致）
-  - **尺寸并进提示词** —— 不并的话出来的图是默认比例，对客户等于换了个尺寸，比失败更糟
-- 响应解析：从 `choices[0].message.content` 的 markdown 图片块里取地址；
-  只回文字（通常是内容审核）**必须判失败**，不能当成"成功但没图"
+- 协议转换：异步任务的请求体 → `POST /v1/images/generations` 的 `{model, prompt, n, size}`
+  - **`size` 是一等参数**，不用拼进提示词
+  - **带参考图的请求直接拒绝**，不降级成纯文生图 —— 悄悄丢掉参考图会出一张
+    构图完全不同的图，而它会被当成成功交给客户，那比失败糟得多
+- 响应解析：取 `data[0].url`；空 url、只有 base64、上游报错 **全部判失败**，不假装成功
+
+> 🔴 **协议是实测出来的，不是照文档抄的。** 第一版照主站 `image2_relay` 的写法走
+> `/v1/chat/completions`，**单测全绿**，对真上游打一次直接被拒：
+> `"This model is not supported on the Chat Completions endpoint"`。
+> 实测结果：`/v1/images/generations`，HTTP 200，**21–26 秒**，`data[0].url` 给地址，
+> `size` 传 `720x1280` 原样回显。
+> ⇒ **改这段协议之前请先对真上游打一次** —— 单测只能证明「我实现的是我以为的协议」。
 - 重投结果从布尔改成三态：`None` / `Async`（换了腿继续轮询）/ `Completed`（同步腿已出图）。
   `Completed` 走**结算**而不是退款 —— 客户拿到图了，这笔钱该收
 
@@ -149,7 +156,7 @@ ORDER BY created_at DESC LIMIT 20;
 
 日志里搜「换到同步腿」。
 
-**测试**：`relay/quriov_sync_image_relay_test.go`（16 条，协议转换与响应解析）+
+**测试**：`relay/quriov_sync_image_relay_test.go`（13 条，协议转换与响应解析，**用真上游实测响应当样本**）+
 `service/task_resubmit_test.go` 里的同步腿一组（5 条）。
 其中最硬的一条是 `TestSyncRelayChannel_IsInvisibleToNormalRouting` ——
 把同步腿的优先级**故意设成最高**，断言正常路由仍然选不到它。
