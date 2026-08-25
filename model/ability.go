@@ -152,7 +152,7 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 // requestPath and model; all other channel types always pass. When requestPath is
 // empty, filtering is skipped.
 func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath string, model string) []Ability {
-	if requestPath == "" || len(abilities) == 0 {
+	if len(abilities) == 0 {
 		return abilities
 	}
 
@@ -179,10 +179,29 @@ func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath strin
 		}
 	}
 
+	// Quriov 改造: 只有同步出图接口的渠道对【正常路由】不可见。
+	// 跟 filterChannelsByRequestPathAndModel 里那段是同一条规则 ——
+	// ⚠ 两个地方都要有: 内存缓存开着走那边, 关着走这边。
+	//   生产是【关着】的, 所以只改那一边等于没改(2026-08-25 实测撞到:
+	//   单测把 MemoryCacheEnabled 设成 true 所以全绿, 真跑起来同步腿照样被选中)。
+	syncRelayOnly := make(map[int]bool, len(channels))
+	for _, channel := range channels {
+		if channel.GetSetting().QuriovSyncImageRelay {
+			syncRelayOnly[channel.Id] = true
+		}
+	}
+
 	filtered := make([]Ability, 0, len(abilities))
 	for _, ability := range abilities {
+		if syncRelayOnly[ability.ChannelId] {
+			continue
+		}
 		config, isAdvancedCustom := advancedConfigs[ability.ChannelId]
 		if !isAdvancedCustom {
+			filtered = append(filtered, ability)
+			continue
+		}
+		if requestPath == "" {
 			filtered = append(filtered, ability)
 			continue
 		}

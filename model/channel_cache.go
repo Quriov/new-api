@@ -352,10 +352,13 @@ func GetSyncRelayChannels(group string, modelName string) []*Channel {
 	if !common.MemoryCacheEnabled {
 		// 内存缓存关掉时直接查库 —— 这条路很冷(只在重投时走), 不做缓存也不心疼。
 		var channels []*Channel
+		//: `group` 是 SQL 保留字, 必须加引号 —— 不加在 sqlite/MySQL 上都是语法错误,
+		//: 而这个函数吞掉 err 返回 nil, 表现是"没有同步腿可换"(静默)。
 		err := DB.Joins("JOIN abilities ON abilities.channel_id = channels.id").
-			Where("abilities.group = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
+			Where("abilities.`group` = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
 			Find(&channels).Error
 		if err != nil {
+			common.SysLog("GetSyncRelayChannels 查库失败, 本次当作没有同步腿可换: " + err.Error())
 			return nil
 		}
 		out := make([]*Channel, 0, len(channels))
