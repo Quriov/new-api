@@ -126,3 +126,44 @@ func recordResubmitPayload(c *gin.Context, task *model.Task) {
 			task.TaskID, len(body), limit))
 	}
 }
+
+// SyncImageRelayOnChannel 对【只有同步接口】的上游直接出图。
+//
+// 跟 ResubmitTaskOnChannel 的区别：那个是"再提交一个异步任务、之后继续轮询"，
+// 这个是"当场把图要出来"。所以它返回的是图片地址，不是任务 ID。
+//
+// ⚠ 会阻塞几十秒。只在轮询协程里调 —— 客户请求链路前面有网关超时，
+//
+//	当初把出图切成异步就是为了躲那个上限。
+func SyncImageRelayOnChannel(ctx context.Context, task *model.Task, ch *model.Channel) (string, []byte, error) {
+	if task == nil || ch == nil {
+		return "", nil, fmt.Errorf("任务或渠道为空")
+	}
+	body, ok := task.ResubmitPayload()
+	if !ok {
+		return "", nil, fmt.Errorf("没有留存原始请求，无法走同步腿")
+	}
+	upstreamModel := task.Properties.UpstreamModelName
+	if upstreamModel == "" {
+		upstreamModel = task.Properties.OriginModelName
+	}
+	if upstreamModel == "" {
+		return "", nil, fmt.Errorf("任务上没有记录模型名，无法走同步腿")
+	}
+	//: 新渠道可能有自己的模型映射（比如上游那边这个模型叫别的名字）。
+	//: GetModelMapping 返回的是一段 JSON 字符串，不是 map。
+	if raw := ch.GetModelMapping(); raw != "" {
+		mapping := make(map[string]string)
+		if err := common.Unmarshal([]byte(raw), &mapping); err == nil {
+			if v, hit := mapping[upstreamModel]; hit && v != "" {
+				upstreamModel = v
+			}
+		}
+	}
+
+	result, err := relay.CallSyncImageRelay(ctx, ch, body, upstreamModel)
+	if err != nil {
+		return "", nil, err
+	}
+	return result.ImageURL, result.RawBody, nil
+}

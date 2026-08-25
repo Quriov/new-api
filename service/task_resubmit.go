@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
@@ -31,6 +32,27 @@ import (
 // 走注入而不是直接调用，是为了不破坏 service -> relay 的依赖方向
 // （跟隔壁 GetTaskAdaptorFunc 同一个套路）。
 var ResubmitTaskFunc func(ctx context.Context, task *model.Task, ch *model.Channel) (upstreamTaskID string, taskData []byte, platform constant.TaskPlatform, err error)
+
+// SyncImageRelayFunc 由 main 包注入，对【只有同步接口】的上游直接出图。
+// 同样走注入，理由跟上面一样：不破坏 service -> relay 的依赖方向。
+//
+// 返回的是【已经出好的图】的地址，不是一个待轮询的任务 ID ——
+// 所以调用方拿到它之后要把任务直接置成成功，而不是继续轮询。
+var SyncImageRelayFunc func(ctx context.Context, task *model.Task, ch *model.Channel) (imageURL string, rawBody []byte, err error)
+
+// ResubmitOutcome 是一次重投尝试的结果。三态而不是布尔，
+// 因为「换了腿继续轮询」和「换的那条腿是同步的、图已经出来了」对调用方
+// 是两种完全不同的后续处理：前者不能结算也不能退款，后者要结算。
+type ResubmitOutcome int
+
+const (
+	// ResubmitNone 没有重投，调用方照原来的失败流程走（终态 + 退款）。
+	ResubmitNone ResubmitOutcome = iota
+	// ResubmitAsync 已重投到另一个异步渠道，任务还活着 —— 不要终结、不要退款。
+	ResubmitAsync
+	// ResubmitCompleted 换到的是同步渠道，图已经出来了 —— 任务直接成功，要结算。
+	ResubmitCompleted
+)
 
 // ResubmitDecision 说明「这次失败要不要换渠道重投」以及为什么。
 // Reason 会进日志，写成人话，方便事后一眼看懂当时为什么没重投。
@@ -118,6 +140,18 @@ func PickResubmitChannel(group, modelName, requestPath string, tried []int) (*mo
 		}
 		lastPicked = ch.Id
 	}
+
+	// 异步渠道都试过了，才轮到「只有同步接口」的那条腿。
+	//
+	// ⚠ 顺序是刻意的：同步腿要阻塞几十秒，而异步渠道提交完就返回。
+	//   先试便宜的，实在没得换了再上贵的。
+	//   而且同步腿往往是唯一一家【不同源】的上游 —— 留到最后，正好覆盖
+	//   「主通道整家塌掉」这种最坏情况。
+	for _, ch := range model.GetSyncRelayChannels(group, modelName) {
+		if !triedSet[ch.Id] {
+			return ch, nil
+		}
+	}
 	return nil, nil
 }
 
@@ -129,17 +163,12 @@ func PickResubmitChannel(group, modelName, requestPath string, tried []int) (*mo
 //
 // 这个函数只在成功时修改 task 的内存字段（渠道、上游任务 ID、状态等），
 // 落库由调用方跟它自己那次 CAS 更新一起做，避免两处各写一次。
-func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, failReason string) bool {
+func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, failReason string) ResubmitOutcome {
 	decision := DecideResubmit(task, failReason)
 	if !decision.ShouldResubmit {
 		logger.LogDebug(ctx, fmt.Sprintf("任务 %s 不重投：%s", task.TaskID, decision.Reason))
-		return false
+		return ResubmitNone
 	}
-	if ResubmitTaskFunc == nil {
-		logger.LogError(ctx, fmt.Sprintf("任务 %s 想重投但重投器没有接线（ResubmitTaskFunc 为空）", task.TaskID))
-		return false
-	}
-
 	tried := task.TriedChannelIDs()
 	modelName := task.Properties.OriginModelName
 	if modelName == "" {
@@ -148,12 +177,25 @@ func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, fail
 	ch, err := PickResubmitChannel(task.Group, modelName, task.PrivateData.ResubmitPath, tried)
 	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("任务 %s 挑重投渠道出错：%s", task.TaskID, err.Error()))
-		return false
+		return ResubmitNone
 	}
 	if ch == nil {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 想换渠道重投，但模型 %s 在分组 %s 下没有别的渠道可换（已试过 %v）",
 			task.TaskID, modelName, task.Group, tried))
-		return false
+		return ResubmitNone
+	}
+
+	// 换到的是「只有同步接口」的那条腿 —— 直接把图出出来，任务当场结束。
+	if ch.GetSetting().QuriovSyncImageRelay {
+		return resubmitViaSyncRelay(ctx, task, ch, failReason)
+	}
+
+	// ⚠ 这个检查必须放在这里, 不能放在函数开头 —— 同步腿那条路压根不用它。
+	//   放在开头的话, 只配了同步腿的部署会在这里被挡回去, 而且失败方式是静默的
+	//   (日志里说"没接线", 看起来像配置问题, 实际是判据放错了地方)。
+	if ResubmitTaskFunc == nil {
+		logger.LogError(ctx, fmt.Sprintf("任务 %s 想重投但异步重投器没有接线（ResubmitTaskFunc 为空）", task.TaskID))
+		return ResubmitNone
 	}
 
 	upstreamTaskID, taskData, platform, err := ResubmitTaskFunc(ctx, task, ch)
@@ -163,7 +205,7 @@ func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, fail
 		// 这一次重投本身失败了，也要把这个渠道记进「试过」，
 		// 否则下一轮轮询会一直挑中同一个坏渠道。
 		task.MarkChannelTried(ch.Id)
-		return false
+		return ResubmitNone
 	}
 
 	fromChannel := task.ChannelId
@@ -189,7 +231,47 @@ func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, fail
 	logger.LogInfo(ctx, fmt.Sprintf("任务 %s 上游失败(%s)，已从渠道 #%d 换到 #%d(%s) 重投，第 %d 次；上游新任务 ID %s",
 		task.TaskID, truncateForLog(failReason, 80), fromChannel, ch.Id, ch.Name,
 		task.PrivateData.ResubmitCount, upstreamTaskID))
-	return true
+	return ResubmitAsync
+}
+
+// resubmitViaSyncRelay 换到只有同步接口的上游：直接把图出出来，任务当场结束。
+//
+// ⚠ 这里会阻塞几十秒。可以这么做的前提是：本函数只被轮询协程调用，
+//
+//	前面没有客户的 HTTP 连接、也没有网关超时。渠道之间是并行轮询的，
+//	所以这段阻塞只会拖慢同一个渠道上排在后面的任务，不影响别的渠道。
+func resubmitViaSyncRelay(ctx context.Context, task *model.Task, ch *model.Channel, failReason string) ResubmitOutcome {
+	if SyncImageRelayFunc == nil {
+		logger.LogError(ctx, fmt.Sprintf("任务 %s 想走同步腿但同步出图器没有接线（SyncImageRelayFunc 为空）", task.TaskID))
+		return ResubmitNone
+	}
+	fromChannel := task.ChannelId
+	start := time.Now()
+
+	imageURL, rawBody, err := SyncImageRelayFunc(ctx, task, ch)
+	// 无论成败都记「试过」——失败时下一轮不该再挑中它。
+	task.MarkChannelTried(ch.Id)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("任务 %s 走同步腿渠道 #%d(%s) 失败（耗时 %.0fs）：%s",
+			task.TaskID, ch.Id, ch.Name, time.Since(start).Seconds(), err.Error()))
+		return ResubmitNone
+	}
+
+	task.ChannelId = ch.Id
+	task.PrivateData.ResubmitCount++
+	task.PrivateData.Key = ""
+	task.PrivateData.ResultURL = imageURL
+	task.Status = model.TaskStatusSuccess
+	task.Progress = "100%"
+	task.FailReason = ""
+	task.FinishTime = time.Now().Unix()
+	if len(rawBody) > 0 {
+		task.Data = rawBody
+	}
+
+	logger.LogInfo(ctx, fmt.Sprintf("任务 %s 上游失败(%s)，已从渠道 #%d 换到同步腿 #%d(%s) 并直接出图成功，耗时 %.0fs",
+		task.TaskID, truncateForLog(failReason, 80), fromChannel, ch.Id, ch.Name, time.Since(start).Seconds()))
+	return ResubmitCompleted
 }
 
 func truncateForLog(s string, n int) string {

@@ -522,6 +522,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	shouldRefund := false
 	shouldSettle := false
 	resubmitted := false
+	syncCompleted := false
 	quota := task.Quota
 
 	task.Status = model.TaskStatus(taskResult.Status)
@@ -556,8 +557,18 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		// Quriov 改造：上游把任务收下之后才失败的这一类，原本到这里就是终态。
 		// 先看看能不能换一个还没试过的渠道把原始请求重投一次；
 		// 重投成功的任务【不进终态、也不退款】——它还活着，下一轮轮询继续跟。
-		if TryResubmitTaskOnAnotherChannel(ctx, task, taskResult.Reason) {
+		switch TryResubmitTaskOnAnotherChannel(ctx, task, taskResult.Reason) {
+		case ResubmitAsync:
+			// 换到另一个异步渠道，任务还活着 —— 不进终态、不退款。
 			resubmitted = true
+		case ResubmitCompleted:
+			// 换到的是只有同步接口的那条腿，图已经出来了 —— 任务直接成功。
+			// 走结算而不是退款：客户拿到图了，这笔钱该收。
+			syncCompleted = true
+		}
+		// ⚠ 这个 break 跳的是【外层】那个 switch(按上游状态分支的那个)。
+		//   上面 case 里不写 break —— Go 的 switch 不穿透, 写了只会跳出内层, 读起来还误导。
+		if resubmitted || syncCompleted {
 			break
 		}
 		task.Status = model.TaskStatusFailure
@@ -574,8 +585,28 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	default:
 		return fmt.Errorf("unknown task status %s for task %s", taskResult.Status, task.TaskID)
 	}
-	if taskResult.Progress != "" && !resubmitted {
+	if taskResult.Progress != "" && !resubmitted && !syncCompleted {
 		task.Progress = taskResult.Progress
+	}
+
+	if syncCompleted {
+		// 同步腿已经把图出出来了。走跟正常成功一样的落库 + 结算路径，
+		// 但状态是我们自己置的（上游那次轮询说的是失败）。
+		// ⚠ 用 CAS 落库：channel_id / 结果 URL / 状态全在这一次写进去。
+		won, err := task.UpdateWithStatus(snap.Status)
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("任务 %s 同步腿出图后落库失败：%s（图已经出了但没记上，需要人工核对）", task.TaskID, err.Error()))
+			return nil
+		}
+		if !won {
+			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 同步腿出图后 CAS 未命中，说明有别的进程同时改了它 —— 跳过结算避免重复计费", task.TaskID))
+			return nil
+		}
+		taskResult.Status = model.TaskStatusSuccess
+		taskResult.Url = task.PrivateData.ResultURL
+		taskResult.Progress = taskcommon.ProgressComplete
+		settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+		return nil
 	}
 
 	if resubmitted {

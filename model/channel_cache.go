@@ -214,7 +214,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 // other channel types always pass. When requestPath is empty, filtering is skipped.
 // Caller must hold channelSyncLock (read lock). The cached slice is never mutated.
 func filterChannelsByRequestPathAndModel(channels []int, requestPath string, model string) []int {
-	if requestPath == "" || len(channels) == 0 {
+	if len(channels) == 0 {
 		return channels
 	}
 	filtered := make([]int, 0, len(channels))
@@ -222,6 +222,17 @@ func filterChannelsByRequestPathAndModel(channels []int, requestPath string, mod
 		channel, ok := channelsIDM[channelId]
 		if !ok {
 			// keep it so the downstream consistency error is raised as before
+			filtered = append(filtered, channelId)
+			continue
+		}
+		// Quriov 改造: 只有同步出图接口的渠道对【正常路由】不可见。
+		// 客户走的是异步任务接口, 把请求发给它必然失败 —— 让它进正常路由等于
+		// 主动制造故障。它只在「任务失败后换渠道重投」那条路上被 GetSyncRelayChannels
+		// 单独挑出来用, 那条路跑在后台、可以等同步调用几十秒。
+		if channel.GetSetting().QuriovSyncImageRelay {
+			continue
+		}
+		if requestPath == "" {
 			filtered = append(filtered, channelId)
 			continue
 		}
@@ -326,4 +337,49 @@ func CacheUpdateChannel(channel *Channel) {
 	// updatePricingLock while holding channelSyncLock would be an AB-BA deadlock.
 	channelSyncLock.Unlock()
 	InvalidatePricingCache()
+}
+
+// GetSyncRelayChannels 返回某分组下能出这个模型、且被标记为【只有同步接口】的渠道。
+//
+// 这些渠道对正常路由是不可见的(见 filterChannelsByRequestPathAndModel)——
+// 客户走异步任务接口, 发给它们必然失败。它们的唯一用途是给
+// 「任务失败后换渠道重投」当备用腿: 那条路跑在后台轮询协程里, 前面没有客户的
+// HTTP 连接、也没有网关超时, 同步等几十秒完全可以。
+//
+// 存在的理由: 唯一一家跟主通道【不同源】的上游只有同步接口, 于是它一直进不来。
+// 主通道整家塌掉时(2026-08-21 实际发生过)我们无腿可换。
+func GetSyncRelayChannels(group string, modelName string) []*Channel {
+	if !common.MemoryCacheEnabled {
+		// 内存缓存关掉时直接查库 —— 这条路很冷(只在重投时走), 不做缓存也不心疼。
+		var channels []*Channel
+		err := DB.Joins("JOIN abilities ON abilities.channel_id = channels.id").
+			Where("abilities.group = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
+			Find(&channels).Error
+		if err != nil {
+			return nil
+		}
+		out := make([]*Channel, 0, len(channels))
+		for _, ch := range channels {
+			if ch.GetSetting().QuriovSyncImageRelay {
+				out = append(out, ch)
+			}
+		}
+		return out
+	}
+
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+
+	ids := group2model2channels[group][modelName]
+	if len(ids) == 0 {
+		normalized := ratio_setting.FormatMatchingModelName(modelName)
+		ids = group2model2channels[group][normalized]
+	}
+	out := make([]*Channel, 0, 2)
+	for _, id := range ids {
+		if ch, ok := channelsIDM[id]; ok && ch.GetSetting().QuriovSyncImageRelay {
+			out = append(out, ch)
+		}
+	}
+	return out
 }
