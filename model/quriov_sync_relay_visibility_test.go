@@ -158,3 +158,88 @@ func TestBothChannelSelectionPathsAgreeOnSyncRelay(t *testing.T) {
 			"只改内存那条等于没改。2026-08-25 就是这么放过一个真 bug 的。")
 	assert.Equal(t, []int{2}, viaCache, "两条都该只剩正常渠道")
 }
+
+// ⭐⭐⭐ 这条钉的是「过滤放错位置」——它比"没过滤"更危险，因为后果是【全站故障】。
+//
+// 2026-08-25 在真库上实测撞到:
+//
+//	同步腿 priority=999、正常渠道 priority=10 →
+//	优先级档位在 SQL 里用 MAX(priority) 算, 同步腿独占最高档 →
+//	之后再把它过滤掉, 那一档空了 → "无可用渠道" →
+//	**优先级更低的正常渠道根本轮不到**。正常客户请求直接全废。
+//
+// 所以排除必须发生在【算档位之前】(SQL 层), 不能查出来再过滤。
+// 这条测试专门盯这个位置: 同步腿优先级设得比正常渠道【高】。
+func TestSyncRelayWithHigherPriorityDoesNotBlockNormalChannels(t *testing.T) {
+	db := setupVisibilityTestDB(t)
+
+	p10, p999, w := int64(10), int64(999), uint(100)
+	require.NoError(t, db.Create(&Channel{
+		Id: 2, Type: 1, Key: "k2", Status: common.ChannelStatusEnabled, Name: "normal",
+		Weight: &w, Models: "gpt-image-2", Group: "default", Priority: &p10,
+	}).Error)
+	sync := &Channel{
+		Id: 9, Type: 1, Key: "k9", Status: common.ChannelStatusEnabled, Name: "sync",
+		Weight: &w, Models: "gpt-image-2", Group: "default", Priority: &p999,
+	}
+	sync.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
+	require.NoError(t, db.Create(sync).Error)
+	require.NoError(t, db.Create(&Ability{Group: "default", Model: "gpt-image-2", ChannelId: 2, Enabled: true, Priority: &p10, Weight: 100}).Error)
+	require.NoError(t, db.Create(&Ability{Group: "default", Model: "gpt-image-2", ChannelId: 9, Enabled: true, Priority: &p999, Weight: 100}).Error)
+
+	// 档位表里不许出现同步腿那一档 —— 出现了就会浪费一次重试在空档上。
+	ids := syncRelayChannelIDs()
+	assert.Equal(t, []int{9}, ids, "同步腿必须被识别出来")
+
+	q, err := getChannelQuery("default", "gpt-image-2", 0)
+	require.NoError(t, err)
+	var abilities []Ability
+	require.NoError(t, q.Find(&abilities).Error)
+	require.NotEmpty(t, abilities,
+		"最高档被同步腿独占并清空了 —— 正常渠道轮不到, 这是【全站故障】不是隔离生效")
+	for _, a := range abilities {
+		assert.NotEqual(t, 9, a.ChannelId, "同步腿不该出现在正常路由的候选里")
+	}
+	assert.Equal(t, 2, abilities[0].ChannelId, "第一档应该直接就是那个正常渠道")
+}
+
+// 同步腿不许占掉一个「优先级档位」——占了会白白吃掉一次重试机会。
+//
+// ⚠ 这条要【三个】渠道才测得出来。两个的时候两种实现给的答案一样:
+//
+//	  排除了:  档位=[10]        retry=1 → 超出范围, 取最小 = 10
+//	  没排除:  档位=[999,10]    retry=1 → 10
+//	一样。所以第一版(只有两个渠道)让「getPriority 不排除」这个变异活了下来。
+//	三个渠道才分得开:
+//	  排除了:  档位=[100,10]     retry=1 → 10   ← 第二次重试就用上最后一条腿
+//	  没排除:  档位=[999,100,10] retry=1 → 100  ← 一次重试白白花在空档上
+func TestSyncRelayDoesNotConsumeAPriorityTier(t *testing.T) {
+	db := setupVisibilityTestDB(t)
+
+	mk := func(id int, prio int64, sync bool) {
+		w := uint(100)
+		p := prio
+		ch := &Channel{
+			Id: id, Type: 1, Key: fmt.Sprintf("k%d", id), Status: common.ChannelStatusEnabled,
+			Name: fmt.Sprintf("ch%d", id), Weight: &w, Models: "gpt-image-2",
+			Group: "default", Priority: &p,
+		}
+		if sync {
+			ch.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
+		}
+		require.NoError(t, db.Create(ch).Error)
+		require.NoError(t, db.Create(&Ability{
+			Group: "default", Model: "gpt-image-2", ChannelId: id,
+			Enabled: true, Priority: &p, Weight: 100,
+		}).Error)
+	}
+	mk(9, 999, true)  // 同步腿，优先级最高
+	mk(2, 100, false) // 正常渠道 A
+	mk(3, 10, false)  // 正常渠道 B
+
+	got, err := getPriority("default", "gpt-image-2", 1)
+	require.NoError(t, err)
+	assert.Equal(t, 10, got,
+		"第一次重试应该直接落到最后一条正常腿(优先级 10)。拿到 100 说明同步腿占了一档, "+
+			"一次重试机会被白白花在一个会被过滤空的档位上")
+}
