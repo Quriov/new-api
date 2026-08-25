@@ -438,26 +438,41 @@ func seedSyncRelayChannel(t *testing.T, db *gorm.DB, id int, priority int64) {
 	}).Error)
 }
 
-// ⭐⭐ 最硬的一条: 同步渠道【绝不能】被正常路由选中。
+// ⭐⭐ 同步渠道【绝不能】被正常路由选中。
 //
 // 客户走的是异步任务接口, 把首次请求发给一个只有同步接口的上游 = 必然失败。
 // 让它进正常路由等于我们主动制造故障 —— 比"没有备份腿"更糟。
+//
+// 🔴 **这条只覆盖了内存缓存那条路。** 渠道选择在 new-api 里有两个实现:
+//
+//	  MemoryCacheEnabled=true  → model/channel_cache.go filterChannelsByRequestPathAndModel  ← 本条
+//	  MemoryCacheEnabled=false → model/ability.go       filterAbilitiesByRequestPathAndModel  ← 见下
+//	**生产是 false**。DB 那条路在 sqlite 上跑不起来(上游查询自带的不兼容, 与本改动无关),
+//	所以它的守卫在 **model/quriov_sync_relay_visibility_test.go** ——
+//	那里直接测两个过滤函数, 并且有一条 TestBothChannelSelectionPathsAgreeOnSyncRelay
+//	钉住"两条路结论必须一致"。
+//
+//	⚠ 别把这条当成完整覆盖。2026-08-25 就是因为只有这一条(而且它把 MemoryCacheEnabled
+//	  设成了 true)而全绿, 真跑起来同步腿照样被正常路由选中并打到了上游。
 func TestSyncRelayChannel_IsInvisibleToNormalRouting(t *testing.T) {
 	db := setupResubmitTest(t)
 	seedResubmitChannel(t, db, 2, 10)   // 正常异步渠道
 	seedSyncRelayChannel(t, db, 9, 100) // 同步腿, 优先级【故意设得最高】
 	model.InitChannelCache()
 
-	// 正常路由把优先级最高的排在前面。如果隔离没做对, 这里会拿到 9。
+	picked := map[int]bool{}
 	for tier := 0; tier < 4; tier++ {
 		ch, err := model.GetRandomSatisfiedChannel(testResubmitGroup, testResubmitModel, tier, testResubmitPath)
 		require.NoError(t, err)
 		if ch == nil {
 			continue
 		}
+		picked[ch.Id] = true
 		assert.NotEqual(t, 9, ch.Id,
 			"优先级最高的同步腿被正常路由选中了 —— 客户的首次请求会被发给一个接不了异步请求的上游")
 	}
+	assert.True(t, picked[2],
+		"正常渠道必须还能被选到 —— 否则这条测试可能只是因为一个都选不出来才'通过'")
 
 	// 反向: 它必须能被【专门查同步腿】的那个函数查到, 否则重投也用不上它。
 	syncs := model.GetSyncRelayChannels(testResubmitGroup, testResubmitModel)
