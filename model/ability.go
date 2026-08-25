@@ -63,9 +63,16 @@ func GetAllEnableAbilities() []Ability {
 func getPriority(group string, model string, retry int) (int, error) {
 
 	var priorities []int
-	err := DB.Model(&Ability{}).
+	// Quriov 改造: 同步腿不参与优先级档位的计算。
+	// 让它进来的话, 档位表里会多出一档只有它的档 —— 那一档被过滤空之后,
+	// 重试次数就白白消耗在一个空档上, 正常渠道可能永远轮不到。
+	q := DB.Model(&Ability{}).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+	if excluded := syncRelayChannelIDs(); len(excluded) > 0 {
+		q = q.Where("channel_id NOT IN ?", excluded)
+	}
+	err := q.
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -90,15 +97,49 @@ func getPriority(group string, model string, retry int) (int, error) {
 	return priorityToUse, nil
 }
 
+// syncRelayChannelIDs 返回被标记为「只有同步接口」的渠道 ID（Quriov 改造）。
+//
+// ⚠ 为什么要在【算优先级档位之前】就把它们排掉, 而不是查出来再过滤:
+//
+//	优先级档位是在 SQL 里用 MAX(priority) 算的。如果一个同步腿的优先级最高,
+//	它会独占最高档 —— 之后再把它过滤掉, 那一档就空了, 结果是"无可用渠道",
+//	**优先级更低的正常渠道根本轮不到**。
+//	2026-08-25 在真库上实测撞到: 同步腿 priority=999、正常渠道 priority=10,
+//	正常请求直接报无可用渠道 = 全站故障。
+//	内存缓存那条路没这个问题(它先过滤再算档位), 所以只有这边需要这一步。
+func syncRelayChannelIDs() []int {
+	var channels []*Channel
+	if err := DB.Select("id, setting").Find(&channels).Error; err != nil {
+		common.SysLog("syncRelayChannelIDs 查库失败, 本次不排除同步腿: " + err.Error())
+		return nil
+	}
+	ids := make([]int, 0, 2)
+	for _, ch := range channels {
+		if ch.GetSetting().QuriovSyncImageRelay {
+			ids = append(ids, ch.Id)
+		}
+	}
+	return ids
+}
+
 func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
+	// Quriov 改造: 同步腿在【算优先级档位之前】就排掉, 理由见 syncRelayChannelIDs。
+	excluded := syncRelayChannelIDs()
+	base := func() *gorm.DB {
+		q := DB.Model(&Ability{}).Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+		if len(excluded) > 0 {
+			q = q.Where("channel_id NOT IN ?", excluded)
+		}
+		return q
+	}
+	maxPrioritySubQuery := base().Select("MAX(priority)")
+	channelQuery := base().Where("priority = (?)", maxPrioritySubQuery)
 	if retry != 0 {
 		priority, err := getPriority(group, model, retry)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
+			channelQuery = base().Where("priority = ?", priority)
 		}
 	}
 
