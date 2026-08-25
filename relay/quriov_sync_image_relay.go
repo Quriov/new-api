@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -26,7 +25,12 @@ import (
 // 同步等几十秒完全可以。（当初把出图切成异步，正是为了消掉网关那 100 秒上限；
 // 那个约束在这条路上不存在。）
 //
-// ⇒ 因此**不需要**造一个通用的「同步包装成异步」的东西。只在重投这条路上直接同步调。
+// ⚠⚠ 协议是 2026-08-24 对真上游实测出来的，不是照文档写的。第一版照主站
+//     image2_relay 的写法走 `/v1/chat/completions`，真打一次直接被拒：
+//     "This model is not supported on the Chat Completions endpoint"。
+//     **单测当时是全绿的** —— 因为单测测的是我以为的协议。
+//     实测结果：走 `/v1/images/generations`，HTTP 200，21–26 秒，
+//     `data[0].url` 直接给图片地址；`size` 是一等参数（不用塞进提示词）。
 
 // SyncImageResult 是一次同步出图的结果。
 type SyncImageResult struct {
@@ -36,62 +40,61 @@ type SyncImageResult struct {
 	RawBody []byte
 }
 
-// : 同步出图上游把结果放在 choices[0].message.content 里，形如
-// : "![image](https://oss.example.top/uploads/<uuid>.png)\n\n"。
-// : 只取第一个 markdown 图片链接 —— 有些提示词会返回多段文字，图片块可能在首行或末行。
-var markdownImageURLPattern = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^\s)]+)\)`)
-
-// : 兜底：有些上游不裹 markdown，直接给一个裸链接。
-var bareImageURLPattern = regexp.MustCompile(`https?://[^\s"'` + "`" + `<>]+\.(?:png|jpe?g|webp)(?:\?[^\s"']*)?`)
-
 // SyncImageRelayTimeout 单次同步出图的上限。
-// 实测这类上游出一张图要 44–90 秒，给到 4 分钟留足余量；
-// 超了就当这条腿也不行，让调用方走原来的失败流程。
+// 实测 21–26 秒；给到 4 分钟留足余量（上游忙时会慢）。
+// 设得太短的失败方式是静默的：看起来像"上游慢"，实际是我们自己掐的。
 const SyncImageRelayTimeout = 4 * time.Minute
 
-// BuildSyncImageRequestBody 把异步任务的请求体转换成同步 chat/completions 的请求体。
+// SyncImageRelayPath 实测通的端点。
+const SyncImageRelayPath = "/v1/images/generations"
+
+// BuildSyncImageRequestBody 把异步任务的请求体转换成同步出图的请求体。
 //
 // 输入是客户提交给 /v1/videos 的原始 JSON，形如：
 //
-//	{"model":"gpt-image-2","prompt":"...","size":"720x1280","images":["https://..."]}
+//	{"model":"gpt-image-2","prompt":"...","size":"720x1280"}
 //
-// 输出是 chat/completions 的 body：图片在前、文字在后（跟主站那条已验证的调法一致）。
+// 输出是 OpenAI 标准出图格式：{model, prompt, n, size}。
+//
+// ⚠ 带参考图的请求会被**拒绝**，不会降级成纯文生图 —— 见 ErrSyncRelayNeedsReferenceImages。
 func BuildSyncImageRequestBody(originalBody []byte, upstreamModel string) ([]byte, error) {
 	var req map[string]any
 	if err := common.Unmarshal(originalBody, &req); err != nil {
 		return nil, fmt.Errorf("原始请求体不是合法 JSON: %w", err)
 	}
 
+	if urls := referenceImageURLs(req); len(urls) > 0 {
+		// 这条同步端点是纯文生图。悄悄把参考图丢掉会出一张【构图完全不同】的图，
+		// 而它会被当成成功交给客户 —— 那比失败糟得多，因为没人会发现。
+		// 宁可这条腿对这类请求不可用。
+		return nil, fmt.Errorf("%w（%d 张）", ErrSyncRelayNeedsReferenceImages, len(urls))
+	}
+
 	prompt := firstNonEmptyString(req, "prompt", "input", "text")
 	if strings.TrimSpace(prompt) == "" {
-		return nil, fmt.Errorf("原始请求里没有提示词，无法转换成 chat 格式")
+		return nil, fmt.Errorf("原始请求里没有提示词，无法转换")
 	}
-	//: 尺寸不是 chat 格式的一等参数，只能并进提示词。不并的话出来的图会是默认比例，
-	//: 对客户来说等于换了个尺寸——那比失败更糟，因为它看起来是成功的。
-	if size := strings.TrimSpace(asString(req["size"])); size != "" {
-		prompt = fmt.Sprintf("%s\n\n(image size: %s)", prompt, size)
-	}
-
-	content := make([]any, 0, 4)
-	for _, u := range referenceImageURLs(req) {
-		content = append(content, map[string]any{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": u},
-		})
-	}
-	content = append(content, map[string]any{"type": "text", "text": prompt})
 
 	body := map[string]any{
-		"model": upstreamModel,
-		"messages": []any{
-			map[string]any{"role": "user", "content": content},
-		},
+		"model":  upstreamModel,
+		"prompt": prompt,
+		"n":      1,
+	}
+	// size 是这个端点的一等参数 —— 实测 720x1280 被正确接受并原样回显。
+	// （第一版把它拼进提示词，那是 chat 格式时代的将就做法，现在不需要了。）
+	if size := strings.TrimSpace(asString(req["size"])); size != "" {
+		body["size"] = size
 	}
 	return common.Marshal(body)
 }
 
+// ErrSyncRelayNeedsReferenceImages 表示这条同步腿接不了带参考图的请求。
+// 单独一个 error 值，是为了让调用方能把它跟"上游挂了"区分开 ——
+// 前者是能力边界（下次同样的请求还是不行），后者是瞬时故障。
+var ErrSyncRelayNeedsReferenceImages = fmt.Errorf("同步腿只支持纯文生图，这个请求带了参考图")
+
 // referenceImageURLs 从原始请求里把参考图地址抠出来。
-// 兼容几种常见字段名——客户端和上游对这个字段的叫法一直不统一。
+// 兼容几种常见字段名 —— 客户端和上游对这个字段的叫法一直不统一。
 func referenceImageURLs(req map[string]any) []string {
 	var out []string
 	for _, key := range []string{"images", "image_urls", "image", "reference_images"} {
@@ -115,16 +118,19 @@ func referenceImageURLs(req map[string]any) []string {
 }
 
 // ParseSyncImageResponse 从同步上游的响应里取出图片地址。
+//
+// 实测响应形状（2026-08-24，真上游）：
+//
+//	{"created":…,"data":[{"revised_prompt":"…","url":"https://…/x.png"}],"size":"720x1280","usage":{…}}
 func ParseSyncImageResponse(body []byte) (*SyncImageResult, error) {
 	var resp struct {
-		Choices []struct {
-			Message struct {
-				Content any `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Data []struct {
+			URL     string `json:"url"`
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
 		Error *struct {
 			Message string `json:"message"`
-			Code    any    `json:"code"`
+			Type    string `json:"type"`
 		} `json:"error"`
 	}
 	if err := common.Unmarshal(body, &resp); err != nil {
@@ -133,54 +139,21 @@ func ParseSyncImageResponse(body []byte) (*SyncImageResult, error) {
 	if resp.Error != nil && strings.TrimSpace(resp.Error.Message) != "" {
 		return nil, fmt.Errorf("上游报错: %s", truncate(resp.Error.Message, 300))
 	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("上游响应里没有 choices: %s", truncate(string(body), 200))
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("上游响应里没有 data: %s", truncate(string(body), 200))
 	}
-
-	text := flattenChatContent(resp.Choices[0].Message.Content)
-	if url := firstMatch(markdownImageURLPattern, text); url != "" {
+	if url := strings.TrimSpace(resp.Data[0].URL); url != "" {
 		return &SyncImageResult{ImageURL: url, RawBody: body}, nil
 	}
-	if url := firstMatch(bareImageURLPattern, text); url != "" {
-		return &SyncImageResult{ImageURL: url, RawBody: body}, nil
+	if resp.Data[0].B64JSON != "" {
+		// 上游给的是内嵌 base64 而不是地址。我们这条路没有落盘的地方,
+		// 硬塞进 task.Data 会让那一行变成几 MB。明确拒绝, 别假装成功。
+		return nil, fmt.Errorf("上游返回的是内嵌 base64 而不是图片地址，这条路不支持")
 	}
-	//: 走到这里通常是内容审核 —— 上游返回了一段解释文字而不是图。
-	//: 原样带回去让调用方去判，这里不猜。
-	return nil, fmt.Errorf("上游没有返回图片，只回了文字: %s", truncate(strings.TrimSpace(text), 300))
+	return nil, fmt.Errorf("上游返回的 data 里既没有 url 也没有 b64_json: %s", truncate(string(body), 200))
 }
 
-// flattenChatContent 把 chat 响应的 content 拍平成文本。
-// content 可能是字符串，也可能是 [{type,text},…] 这种数组。
-func flattenChatContent(content any) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case []any:
-		var sb strings.Builder
-		for _, item := range v {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if s := asString(m["text"]); s != "" {
-				sb.WriteString(s)
-				sb.WriteString("\n")
-			}
-			//: 有的上游把图片放在 image_url 结构里而不是 markdown 文本里。
-			if iu, ok := m["image_url"].(map[string]any); ok {
-				if s := asString(iu["url"]); s != "" {
-					sb.WriteString(s)
-					sb.WriteString("\n")
-				}
-			}
-		}
-		return sb.String()
-	default:
-		return ""
-	}
-}
-
-// CallSyncImageRelay 同步调用一个只有 chat/completions 的出图上游。
+// CallSyncImageRelay 同步调用一个只有出图接口（没有异步任务接口）的上游。
 //
 // ⚠ 这个调用会阻塞几十秒。只能在后台协程里用，绝不能放进客户请求链路
 // （那里有网关超时，正是当初切异步要躲的东西）。
@@ -197,12 +170,11 @@ func CallSyncImageRelay(ctx context.Context, ch *model.Channel, originalBody []b
 	if baseURL == "" {
 		return nil, fmt.Errorf("渠道 #%d 没有配置 base_url", ch.Id)
 	}
-	endpoint := baseURL + "/v1/chat/completions"
 
 	callCtx, cancel := context.WithTimeout(ctx, SyncImageRelayTimeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, baseURL+SyncImageRelayPath, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败: %w", err)
 	}
@@ -241,17 +213,6 @@ func firstNonEmptyString(m map[string]any, keys ...string) string {
 		if s := strings.TrimSpace(asString(m[k])); s != "" {
 			return s
 		}
-	}
-	return ""
-}
-
-func firstMatch(re *regexp.Regexp, s string) string {
-	m := re.FindStringSubmatch(s)
-	if len(m) > 1 {
-		return m[1]
-	}
-	if len(m) == 1 {
-		return m[0]
 	}
 	return ""
 }
