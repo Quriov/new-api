@@ -23,6 +23,19 @@ type ChannelSettings struct {
 	// HTTP2ConnectionShards spreads HTTP/2 traffic across N independent transports
 	// (1-8). Zero/unset means 1. Ignored when HTTPProtocol is "http1".
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
+
+	// ── Quriov 改造 ──────────────────────────────────────────────────
+	// QuriovSyncImageRelay 标记这个渠道【只有同步出图接口】(chat/completions),
+	// 没有异步任务接口。
+	//
+	// 为什么需要它: 我们的客户走异步 /v1/videos 提交图片任务, 所以只有同样支持
+	// 异步的上游才进得来。这把一整家上游挡在了门外 —— 而那恰恰是唯一一家跟主通道
+	// 不同源的备份线, 主通道整家塌掉时(2026-08-21 实际发生过)我们无腿可换。
+	//
+	// 标了这个的渠道**不会**被正常提交流程选中(它接不了异步请求),
+	// 只在【任务失败后换渠道重投】那条路上才会被选 —— 那条路跑在后台轮询协程里,
+	// 前面没有客户的 HTTP 连接、也没有网关超时, 同步等几十秒完全可以。
+	QuriovSyncImageRelay bool `json:"quriov_sync_image_relay,omitempty"`
 }
 
 const (

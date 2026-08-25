@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,6 +42,7 @@ func setupResubmitTest(t *testing.T) *gorm.DB {
 	origMax := constant.TaskResubmitMaxAttempts
 	origSkip := constant.TaskResubmitSkipReasons
 	origFunc := ResubmitTaskFunc
+	origSyncFunc := SyncImageRelayFunc
 
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -60,6 +62,7 @@ func setupResubmitTest(t *testing.T) *gorm.DB {
 		constant.TaskResubmitMaxAttempts = origMax
 		constant.TaskResubmitSkipReasons = origSkip
 		ResubmitTaskFunc = origFunc
+		SyncImageRelayFunc = origSyncFunc
 		if origMemCache && origDB != nil &&
 			origDB.Migrator().HasTable(&model.Channel{}) && origDB.Migrator().HasTable(&model.Ability{}) {
 			model.InitChannelCache()
@@ -138,9 +141,9 @@ func TestResubmit_SwitchesToAnotherChannelWhenUpstreamFails(t *testing.T) {
 	}
 
 	task := newFailedTask(2)
-	ok := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
 
-	require.True(t, ok, "上游侧失败必须触发换渠道重投")
+	require.Equal(t, ResubmitAsync, out, "上游侧失败必须触发换渠道重投")
 	assert.Equal(t, 3, calledOnChannel, "必须打到没试过的那个渠道，而不是原来那个")
 	assert.Equal(t, 3, task.ChannelId, "任务的渠道要跟着换过去")
 	assert.Equal(t, "upstream-new", task.PrivateData.UpstreamTaskID, "要跟踪新的上游任务 ID")
@@ -170,9 +173,9 @@ func TestResubmit_ContentPolicyFailureIsNotRetried(t *testing.T) {
 	}
 
 	task := newFailedTask(2)
-	ok := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonContentReject)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonContentReject)
 
-	require.False(t, ok, "内容审核类失败不该重投")
+	require.Equal(t, ResubmitNone, out, "内容审核类失败不该重投")
 	assert.False(t, called, "根本不该发出重投请求")
 	assert.Equal(t, 2, task.ChannelId, "渠道不该被改动")
 	assert.Equal(t, 0, task.PrivateData.ResubmitCount)
@@ -239,9 +242,9 @@ func TestResubmit_DeclinesWhenNoOtherChannelAvailable(t *testing.T) {
 	}
 
 	task := newFailedTask(2)
-	ok := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
 
-	require.False(t, ok, "没有第二条腿就不该假装重投成功")
+	require.Equal(t, ResubmitNone, out, "没有第二条腿就不该假装重投成功")
 	assert.False(t, called, "不该把请求再打给同一个已经失败的渠道")
 	assert.Equal(t, 2, task.ChannelId)
 }
@@ -257,9 +260,9 @@ func TestResubmit_MarksChannelTriedWhenResubmitCallItselfFails(t *testing.T) {
 	}
 
 	task := newFailedTask(2)
-	ok := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
 
-	require.False(t, ok)
+	require.Equal(t, ResubmitNone, out)
 	assert.ElementsMatch(t, []int{2, 3}, task.TriedChannelIDs(),
 		"重投本身失败的渠道也要记进已试清单，否则下一轮会反复挑中同一个坏渠道")
 	assert.Equal(t, 2, task.ChannelId, "重投没成功，任务还留在原渠道上")
@@ -276,7 +279,7 @@ func TestResubmit_FollowsNewChannelPlatformSoPollingUsesRightAdaptor(t *testing.
 	}
 
 	task := newFailedTask(2)
-	require.True(t, TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch))
+	require.Equal(t, ResubmitAsync, TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch))
 	assert.Equal(t, constant.TaskPlatform("33"), task.Platform,
 		"轮询是按 platform 挑适配器的，换了不同类型的渠道就必须跟着改，否则下一轮拿错适配器")
 }
@@ -414,4 +417,136 @@ func TestSkipReasons_DefaultListIsNotAllOrNothing(t *testing.T) {
 		t.Fatalf("默认清单变成一刀切了: 跳过 %d 条 / 重投 %d 条 —— "+
 			"两边都必须有, 否则清单不是清空了就是加了能匹配一切的模式", skipped, retried)
 	}
+}
+
+// ── 同步腿（只有同步接口的上游）────────────────────────────────────────
+
+// seedSyncRelayChannel 造一个被标记为「只有同步出图接口」的渠道。
+func seedSyncRelayChannel(t *testing.T, db *gorm.DB, id int, priority int64) {
+	t.Helper()
+	weight := uint(100)
+	ch := &model.Channel{
+		Id: id, Type: constant.ChannelTypeOpenAI, Key: fmt.Sprintf("key-%d", id),
+		Status: common.ChannelStatusEnabled, Name: fmt.Sprintf("sync-relay-%d", id),
+		Weight: &weight, Models: testResubmitModel, Group: testResubmitGroup, Priority: &priority,
+	}
+	ch.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
+	require.NoError(t, db.Create(ch).Error)
+	require.NoError(t, db.Create(&model.Ability{
+		Group: testResubmitGroup, Model: testResubmitModel, ChannelId: id,
+		Enabled: true, Priority: &priority, Weight: weight,
+	}).Error)
+}
+
+// ⭐⭐ 最硬的一条: 同步渠道【绝不能】被正常路由选中。
+//
+// 客户走的是异步任务接口, 把首次请求发给一个只有同步接口的上游 = 必然失败。
+// 让它进正常路由等于我们主动制造故障 —— 比"没有备份腿"更糟。
+func TestSyncRelayChannel_IsInvisibleToNormalRouting(t *testing.T) {
+	db := setupResubmitTest(t)
+	seedResubmitChannel(t, db, 2, 10)   // 正常异步渠道
+	seedSyncRelayChannel(t, db, 9, 100) // 同步腿, 优先级【故意设得最高】
+	model.InitChannelCache()
+
+	// 正常路由把优先级最高的排在前面。如果隔离没做对, 这里会拿到 9。
+	for tier := 0; tier < 4; tier++ {
+		ch, err := model.GetRandomSatisfiedChannel(testResubmitGroup, testResubmitModel, tier, testResubmitPath)
+		require.NoError(t, err)
+		if ch == nil {
+			continue
+		}
+		assert.NotEqual(t, 9, ch.Id,
+			"优先级最高的同步腿被正常路由选中了 —— 客户的首次请求会被发给一个接不了异步请求的上游")
+	}
+
+	// 反向: 它必须能被【专门查同步腿】的那个函数查到, 否则重投也用不上它。
+	syncs := model.GetSyncRelayChannels(testResubmitGroup, testResubmitModel)
+	require.Len(t, syncs, 1, "同步腿必须能被专用查询找到，否则它对谁都不可见 = 白配")
+	assert.Equal(t, 9, syncs[0].Id)
+}
+
+// 挑渠道时同步腿排在最后 —— 先试便宜的异步渠道，实在没得换才上要阻塞几十秒的它。
+func TestPickResubmitChannel_PrefersAsyncChannelsOverSyncRelay(t *testing.T) {
+	db := setupResubmitTest(t)
+	seedResubmitChannel(t, db, 2, 10)
+	seedResubmitChannel(t, db, 3, 0)
+	seedSyncRelayChannel(t, db, 9, 100)
+	model.InitChannelCache()
+
+	ch, err := PickResubmitChannel(testResubmitGroup, testResubmitModel, testResubmitPath, []int{2})
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+	assert.Equal(t, 3, ch.Id, "还有异步渠道没试过时，不该先去用要阻塞几十秒的同步腿")
+
+	// 异步的都试过了，才轮到它。
+	ch, err = PickResubmitChannel(testResubmitGroup, testResubmitModel, testResubmitPath, []int{2, 3})
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+	assert.Equal(t, 9, ch.Id, "异步渠道全试过之后必须能换到同步腿 —— 这正是它存在的意义")
+}
+
+// ⭐ 主判据: 换到同步腿之后，任务直接成功（而不是继续轮询一个不存在的上游任务）。
+func TestResubmit_SyncRelayCompletesTheTaskImmediately(t *testing.T) {
+	db := setupResubmitTest(t)
+	seedResubmitChannel(t, db, 2, 10)
+	seedSyncRelayChannel(t, db, 9, 0)
+	model.InitChannelCache()
+
+	var gotChannel int
+	SyncImageRelayFunc = func(_ context.Context, _ *model.Task, ch *model.Channel) (string, []byte, error) {
+		gotChannel = ch.Id
+		return "https://oss.example.top/u/final.png", []byte(`{"ok":true}`), nil
+	}
+	ResubmitTaskFunc = func(context.Context, *model.Task, *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+		t.Fatal("同步腿不该走异步重投那条路")
+		return "", nil, "", nil
+	}
+
+	task := newFailedTask(2)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+
+	require.Equal(t, ResubmitCompleted, out, "同步腿出图成功 ≠ 普通重投，调用方要据此去结算而不是退款")
+	assert.Equal(t, 9, gotChannel)
+	assert.Equal(t, 9, task.ChannelId)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	assert.Equal(t, "https://oss.example.top/u/final.png", task.PrivateData.ResultURL)
+	assert.Equal(t, "100%", task.Progress)
+	assert.Empty(t, task.FailReason)
+	assert.NotZero(t, task.FinishTime, "任务结束了，完成时间要落上")
+	assert.Equal(t, "task_test_0001", task.TaskID, "客户手上的 task_id 不变")
+}
+
+// 同步腿自己也失败时: 不能假装成功，且要记进「试过」防止下一轮反复挑它。
+func TestResubmit_SyncRelayFailureDoesNotFakeSuccess(t *testing.T) {
+	db := setupResubmitTest(t)
+	seedResubmitChannel(t, db, 2, 10)
+	seedSyncRelayChannel(t, db, 9, 0)
+	model.InitChannelCache()
+
+	SyncImageRelayFunc = func(context.Context, *model.Task, *model.Channel) (string, []byte, error) {
+		return "", nil, fmt.Errorf("上游没有返回图片，只回了文字: I can't generate that")
+	}
+
+	task := newFailedTask(2)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+
+	require.Equal(t, ResubmitNone, out, "同步腿失败必须走回原来的失败流程（终态 + 退款）")
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status, "状态不该被改成成功")
+	assert.Empty(t, task.PrivateData.ResultURL, "没出图就不能留下结果地址")
+	assert.Equal(t, 2, task.ChannelId, "没成功就不该把任务挪到那个渠道名下")
+	assert.ElementsMatch(t, []int{2, 9}, task.TriedChannelIDs(), "失败的同步腿也要记进已试清单")
+}
+
+// 没接线时不能静默当成没有备份腿 —— 要在日志里说清楚，且绝不假装成功。
+func TestResubmit_SyncRelayNotWiredIsSafe(t *testing.T) {
+	db := setupResubmitTest(t)
+	seedResubmitChannel(t, db, 2, 10)
+	seedSyncRelayChannel(t, db, 9, 0)
+	model.InitChannelCache()
+	SyncImageRelayFunc = nil
+
+	task := newFailedTask(2)
+	out := TryResubmitTaskOnAnotherChannel(context.Background(), task, prodReasonUpstreamGlitch)
+	require.Equal(t, ResubmitNone, out)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
 }
