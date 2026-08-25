@@ -16,6 +16,11 @@ on:
         description: '额外的 tag(可选)。不填只打 commit sha 和 quriov-latest'
         required: false
         type: string
+      export_tarball:
+        description: '同时把镜像导成压缩包当 artifact(给拉不到 registry 的机器用)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [quriov]
 
@@ -77,6 +82,27 @@ jobs:
           docker rmi "$IMG:${{ steps.meta.outputs.sha }}" || true
           docker pull "$IMG:${{ steps.meta.outputs.sha }}"
           docker run --rm --entrypoint /bin/sh "$IMG:${{ steps.meta.outputs.sha }}" -c 'test -x /new-api && echo 二进制在'
+
+      # 给拉不到 ghcr 的机器用: 把镜像导成压缩包当 artifact, 下载后 docker load。
+      #
+      # ⚠ 这是【绕路】不是正路。正路是把 ghcr 上那个 package 设成 public
+      #   (本仓公开、镜像由公开源码编译, 不含任何密钥), 那样生产机 docker pull
+      #   就完事。压缩包这条每次都要人搬一次 —— 只在还没设 public 之前用。
+      - name: 导成压缩包 (可选)
+        if: ${{ inputs.export_tarball }}
+        run: |
+          set -eux
+          docker save "$IMG:${{ steps.meta.outputs.sha }}" | gzip -1 > /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+          ls -lh /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+
+      - name: 上传压缩包 (可选)
+        if: ${{ inputs.export_tarball }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-api-image-${{ steps.meta.outputs.sha }}
+          path: /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+          retention-days: 3
+          compression-level: 0
 
       - name: 告诉人怎么用
         run: |
