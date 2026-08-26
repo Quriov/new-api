@@ -42,7 +42,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 记录这次推的是什么
+      - name: 记录这次推的是什么 + 写 VERSION
         id: meta
         run: |
           set -eu
@@ -50,6 +50,12 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "推的 commit: $(git rev-parse HEAD)"
           echo "上游冻结点: $(git log --oneline | tail -1)"
+          # ⚠ 必须写 VERSION —— Dockerfile 靠 `-X '...common.Version=$(cat VERSION)'` 注入版本,
+          #   而仓库里那个 VERSION 文件是空的(上游只在它自己的 release 流水线里 `echo TAG > VERSION`)。
+          #   不写的话镜像跑起来 /api/status 的 version 是**空字符串** —— 线上没法一眼看出跑的是哪一版。
+          #   2026-08-26 api.quriov.com 切到 fork 镜像后实测踩到, 见 Quriov-AI-Video#1724。
+          echo "quriov-$SHA" > VERSION
+          echo "VERSION 写入: $(cat VERSION)"
 
       - uses: docker/login-action@v3
         with:
