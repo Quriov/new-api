@@ -77,7 +77,9 @@ func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Chan
 	}
 	info.Action = task.Action
 	info.OriginModelName = modelName
-	info.UpstreamModelName = modelName
+	// ChannelMeta (which owns UpstreamModelName) is initialized inside
+	// ResubmitTaskToChannel. Touching the promoted field before that call
+	// dereferences a nil ChannelMeta and crashes the polling goroutine.
 	if info.TaskRelayInfo != nil {
 		// 沿用原来的公开任务 ID：客户手上的 task_id 不变，
 		// 他不需要知道我们在底下换了一条腿。
