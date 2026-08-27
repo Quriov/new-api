@@ -87,6 +87,20 @@ ORDER BY created_at DESC LIMIT 20;
 `service/task_resubmit_polling_test.go`（2 条，**从轮询这一层进来**，盯的是钩子有没有真的接上——
 只有前者的话，把 `task_polling.go` 里那行调用删掉，测试依然全绿）。
 
+#### 2026-08-27 补丁：重投执行端在渠道元数据初始化前空指针
+
+**线上症状**：任务提交成功并留在“未开始 / 0%”，健康接口仍然返回成功；后台每轮处理失败任务时，
+`ResubmitTaskOnChannel` 都会触发空指针，待处理任务持续累积。容器没有退出，所以只看健康检查和
+重启次数会得到假绿。
+
+**根因**：`RelayInfo.UpstreamModelName` 实际来自内嵌的 `ChannelMeta`。重投执行端在
+`ResubmitTaskToChannel` 初始化 `ChannelMeta` **之前**写这个提升字段，等价于解引用空指针。
+这次提前赋值也是重复的：下游初始化渠道元数据后会用原始模型名填入该字段，并继续做渠道模型映射。
+
+**修复与守卫**：删除过早赋值，让 `ResubmitTaskToChannel` 继续作为渠道元数据的单一初始化点；
+`controller/task_resubmit_test.go` 从真实重投入口进入，断言该路径不再 panic，并且能继续走到适配器选择。
+该测试在未修版本上会稳定复现 `controller/task_resubmit.go:80` 的同一个空指针。
+
 ### 2. 让「只有同步接口」的上游也能当备份腿（2026-08-24）
 
 **治的问题**：我们的客户走异步 `/v1/videos` 提交图片任务，所以**只有同样支持异步的上游才进得来**。
