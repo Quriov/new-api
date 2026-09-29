@@ -70,10 +70,16 @@ jobs:
           IMG=$(echo "$IMG" | tr '[:upper:]' '[:lower:]')   # ghcr 只吃小写
           docker build --progress=plain \
             -t "$IMG:${{ steps.meta.outputs.sha }}" \
-            -t "$IMG:quriov-latest" \
             .
           docker push "$IMG:${{ steps.meta.outputs.sha }}"
-          docker push "$IMG:quriov-latest"
+          # quriov-latest 只跟 quriov 分支走。从别的分支手动触发（比如升级候选分支先出镜像试跑）
+          # 只推 sha tag —— 不然「最新」会被一个还没合并、没上线的分支顶掉。
+          if [ "${{ github.ref }}" = "refs/heads/quriov" ]; then
+            docker tag "$IMG:${{ steps.meta.outputs.sha }}" "$IMG:quriov-latest"
+            docker push "$IMG:quriov-latest"
+          else
+            echo "非 quriov 分支（${{ github.ref }}），不动 quriov-latest"
+          fi
           if [ -n "${{ inputs.tag }}" ]; then
             docker tag "$IMG:${{ steps.meta.outputs.sha }}" "$IMG:${{ inputs.tag }}"
             docker push "$IMG:${{ inputs.tag }}"
