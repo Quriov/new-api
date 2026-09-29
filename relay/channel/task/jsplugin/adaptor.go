@@ -316,6 +316,20 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, err
 	}
+	// Quriov 改造 3：渠道的「参数覆盖」也作用于任务提交体（上游只在同步接口上生效）。
+	// 用途：一个对外型号名映射到上游同一个型号、靠请求参数选档时，
+	// 由渠道配置按 original_model 补上档位参数。见 QURIOV.md 改造 3。
+	// 挂在插件造好的最终 JSON 上（插件已把 model 换成上游名），所以对所有任务插件一致；
+	// 首次提交、渠道重试、换渠道重投都经过这里。
+	// 没配参数覆盖的渠道完全不走这段 —— 请求体与改造前逐字相同。
+	// multipart / 纯文本请求体不处理 —— 参数覆盖是 JSON 路径语义。
+	if len(info.ParamOverride) > 0 {
+		overridden, overrideErr := relaycommon.ApplyParamOverrideWithRelayInfo(body, info)
+		if overrideErr != nil {
+			return nil, fmt.Errorf("apply_param_override_failed: %w", overrideErr)
+		}
+		return bytes.NewReader(overridden), nil
+	}
 	return bytes.NewReader(body), nil
 }
 
