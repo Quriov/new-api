@@ -210,6 +210,18 @@ func initConstantEnv() {
 	constant.TaskPluginProtocolTickJitterMilliseconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_TICK_JITTER_MILLISECONDS", 500)
 	constant.TaskPluginProtocolHeartbeatSeconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_HEARTBEAT_SECONDS", 15)
 
+	// 任务失败后换渠道重投（Quriov 改造）。
+	// 默认【开】：默认关会造出「代码写好了但没在起作用」这种最难发现的空转，
+	// 而这条机制本身是保守的——只重投 1 次、且内容审核类失败一律不重投。
+	constant.TaskResubmitEnabled = GetEnvOrDefaultBool("TASK_RESUBMIT_ENABLED", true)
+	constant.TaskResubmitMaxAttempts = GetEnvOrDefault("TASK_RESUBMIT_MAX_ATTEMPTS", 1)
+	constant.TaskResubmitMaxBodyKB = GetEnvOrDefault("TASK_RESUBMIT_MAX_BODY_KB", 256)
+	constant.TaskResubmitSkipReasons = splitAndTrim(GetEnvOrDefaultString(
+		"TASK_RESUBMIT_SKIP_REASONS",
+		// 默认清单只放有实证的：这些是「换家上游一样会拒」的失败。
+		"没有按照预期生成图片,内容审核,违规内容,敏感内容,content_policy,content policy,safety system,prompt was rejected",
+	))
+
 	soraPatchStr := GetEnvOrDefaultString("TASK_PRICE_PATCH", "")
 	if soraPatchStr != "" {
 		var taskPricePatches []string
@@ -235,4 +247,19 @@ func initConstantEnv() {
 		}
 	}
 	constant.TrustedRedirectDomains = trustedDomains
+}
+
+// splitAndTrim 把逗号分隔的配置串切成非空片段，两端空白去掉。（Quriov 改造）
+func splitAndTrim(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

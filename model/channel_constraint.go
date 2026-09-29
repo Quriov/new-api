@@ -20,6 +20,14 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
 	if ch == nil {
 		return false, ""
 	}
+	// Quriov 改造: 只有同步出图接口的渠道对【正常路由】不可见, 无论带不带过滤器。
+	// 客户走的是异步任务接口, 把请求发给它必然失败 —— 让它进正常路由等于主动制造故障。
+	// 它只在「任务失败后换渠道重投」那条路上被 GetSyncRelayChannels 单独挑出来用。
+	// ⚠ 数据库路径(内存缓存关着, 生产就是关着的)走这里; 内存缓存路径走 filterCandidateIDs,
+	//   两处都要有 —— 2026-08-25 只改一边、单测全绿、生产照样选中同步腿。
+	if isSyncRelayOnly(ch) {
+		return false, ""
+	}
 	for _, kind := range filterEvalOrder {
 		for _, filter := range filters {
 			if filter.Kind != kind {
@@ -41,7 +49,7 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
 	if len(ids) == 0 {
 		return ids, ""
 	}
-	kept = ids
+	kept = withoutSyncRelayOnly(ids)
 	for _, kind := range filterEvalOrder {
 		kindFilters := filtersByKind(filters, kind)
 		if len(kindFilters) == 0 {
@@ -60,6 +68,25 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
 		kept = next
 	}
 	return kept, ""
+}
+
+// isSyncRelayOnly 判断渠道是否被标记为「只有同步出图接口」（Quriov 改造，见 QURIOV.md 改造 2）。
+func isSyncRelayOnly(ch *Channel) bool {
+	return ch != nil && ch.GetSetting().QuriovSyncImageRelay
+}
+
+// withoutSyncRelayOnly 从内存缓存的候选 ID 里去掉同步腿（Quriov 改造）。
+// 不在 channelsIDM 里的 ID 原样保留（跟上游对缺失 ID 的处理一致，由下游报一致性错误）。
+// 调用方必须持有 channelSyncLock 读锁。输入切片不被修改。
+func withoutSyncRelayOnly(ids []int) []int {
+	out := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if ch, ok := channelsIDM[id]; ok && isSyncRelayOnly(ch) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 func filtersByKind(filters []dto.ChannelFilter, kind dto.ChannelFilterKind) []dto.ChannelFilter {

@@ -307,3 +307,52 @@ func CacheUpdateChannel(channel *Channel) {
 	channelSyncLock.Unlock()
 	InvalidatePricingCache()
 }
+
+// GetSyncRelayChannels 返回某分组下能出这个模型、且被标记为【只有同步接口】的渠道（Quriov 改造）。
+//
+// 这些渠道对正常路由是不可见的(见 channel_constraint.go 的 isSyncRelayOnly)——
+// 客户走异步任务接口, 发给它们必然失败。它们的唯一用途是给
+// 「任务失败后换渠道重投」当备用腿: 那条路跑在后台轮询协程里, 前面没有客户的
+// HTTP 连接、也没有网关超时, 同步等几十秒完全可以。
+//
+// 存在的理由: 唯一一家跟主通道【不同源】的上游只有同步接口, 于是它一直进不来。
+// 主通道整家塌掉时(2026-08-21 实际发生过)我们无腿可换。
+func GetSyncRelayChannels(group string, modelName string) []*Channel {
+	if !common.MemoryCacheEnabled {
+		// 内存缓存关掉时直接查库 —— 这条路很冷(只在重投时走), 不做缓存也不心疼。
+		var channels []*Channel
+		// `group` 是 SQL 保留字, 用上游统一的 commonGroupCol(MySQL/SQLite 反引号、PG 双引号)。
+		// 不加引号在 sqlite/MySQL 上都是语法错误, 而这个函数吞掉 err 返回 nil,
+		// 表现是"没有同步腿可换"(静默)。
+		err := DB.Joins("JOIN abilities ON abilities.channel_id = channels.id").
+			Where("abilities."+commonGroupCol+" = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
+			Find(&channels).Error
+		if err != nil {
+			common.SysLog("GetSyncRelayChannels 查库失败, 本次当作没有同步腿可换: " + err.Error())
+			return nil
+		}
+		out := make([]*Channel, 0, len(channels))
+		for _, ch := range channels {
+			if ch.Status == common.ChannelStatusEnabled && isSyncRelayOnly(ch) {
+				out = append(out, ch)
+			}
+		}
+		return out
+	}
+
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+
+	ids := group2model2channels[group][modelName]
+	if len(ids) == 0 {
+		normalized := ratio_setting.RoutingMatchModelName(modelName)
+		ids = group2model2channels[group][normalized]
+	}
+	out := make([]*Channel, 0, 2)
+	for _, id := range ids {
+		if ch, ok := channelsIDM[id]; ok && isSyncRelayOnly(ch) {
+			out = append(out, ch)
+		}
+	}
+	return out
+}

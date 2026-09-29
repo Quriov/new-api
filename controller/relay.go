@@ -678,6 +678,13 @@ func executeTaskSubmissionWith(
 			insertOmits = append(insertOmits, "data")
 		}
 	}
+	// Quriov 改造：留存原始请求，供任务在上游侧失败后换渠道重投。
+	// 只对还要轮询的任务留存 —— 提交时就已终态的任务不会再走失败分支。
+	// 不留存也能正常工作，只是那个任务失去了换腿的能力（会在日志里说明）。
+	if constant.TaskResubmitEnabled && !immediateTerminal {
+		task.MarkChannelTried(channelIDForResubmit(c))
+		recordResubmitPayload(c, task)
+	}
 	diagnostics.insertStart(task)
 	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
 		common.SysError("insert task error: " + insertErr.Error())

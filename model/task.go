@@ -136,6 +136,15 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+
+	// ── 任务失败后换渠道重投（Quriov 改造）────────────────────────────
+	// ⚠ 加字段后必须同步改下面 Value() 里的「全空」判断，否则只填了这几个字段的
+	//   私有数据会被当成空值写成 NULL（上游从 rc.28 起改成逐字段判空）。
+	ResubmitBodyB64     string `json:"resubmit_body_b64,omitempty"`     // 原始请求体(base64)，重投时原样发给新渠道
+	ResubmitContentType string `json:"resubmit_content_type,omitempty"` // 原始 Content-Type
+	ResubmitPath        string `json:"resubmit_path,omitempty"`         // 原始请求路径
+	TriedChannels       string `json:"tried_channels,omitempty"`        // 试过的渠道 ID，逗号分隔，含首次提交那个
+	ResubmitCount       int    `json:"resubmit_count,omitempty"`        // 已经重投了几次
 }
 
 type TaskExecutionSnapshot struct {
@@ -214,7 +223,10 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded &&
+		// Quriov 改造：换渠道重投的留存字段
+		p.ResubmitBodyB64 == "" && p.ResubmitContentType == "" && p.ResubmitPath == "" &&
+		p.TriedChannels == "" && p.ResubmitCount == 0 {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。

@@ -552,6 +552,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	now := time.Now().Unix()
 	shouldFinalizeBilling := false
+	resubmitted := false   // Quriov 改造：换到另一个异步渠道，任务继续轮询
+	syncCompleted := false // Quriov 改造：换到同步腿，图已当场出好
 
 	task.Status = parsedStatus
 	switch parsedStatus {
@@ -582,6 +584,23 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		shouldFinalizeBilling = true
 	case model.TaskStatusFailure:
 		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
+		// Quriov 改造：上游把任务收下之后才失败的这一类，原本到这里就是终态。
+		// 先看看能不能换一个还没试过的渠道把原始请求重投一次；
+		// 重投成功的任务【不进终态、也不退款】——它还活着，下一轮轮询继续跟。
+		switch TryResubmitTaskOnAnotherChannel(ctx, task, taskResult.Reason) {
+		case ResubmitAsync:
+			// 换到另一个异步渠道，任务还活着 —— 不进终态、不退款。
+			resubmitted = true
+		case ResubmitCompleted:
+			// 换到的是只有同步接口的那条腿，图已经出来了 —— 任务直接成功。
+			// 走结算而不是退款：客户拿到图了，这笔钱该收。
+			syncCompleted = true
+		}
+		// ⚠ 这个 break 跳的是【外层】那个 switch(按上游状态分支的那个)。
+		//   上面 case 里不写 break —— Go 的 switch 不穿透, 写了只会跳出内层, 读起来还误导。
+		if resubmitted || syncCompleted {
+			break
+		}
 		task.Status = model.TaskStatusFailure
 		task.Progress = taskcommon.ProgressComplete
 		if task.FinishTime == 0 {
@@ -592,8 +611,45 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Progress = taskcommon.ProgressComplete
 		shouldFinalizeBilling = true
 	}
-	if taskResult.Progress != "" {
+	if taskResult.Progress != "" && !resubmitted && !syncCompleted {
 		task.Progress = taskResult.Progress
+	}
+
+	if syncCompleted {
+		// 同步腿已经把图出出来了。走跟正常成功一样的落库 + 结算路径，
+		// 但状态是我们自己置的（上游那次轮询说的是失败）。
+		// ⚠ 用 CAS 落库：channel_id / 结果 URL / 状态全在这一次写进去。
+		won, err := task.UpdateWithStatus(snap.Status)
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("任务 %s 同步腿出图后落库失败：%s（图已经出了但没记上，需要人工核对）", task.TaskID, err.Error()))
+			return nil
+		}
+		if !won {
+			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 同步腿出图后 CAS 未命中，说明有别的进程同时改了它 —— 跳过结算避免重复计费", task.TaskID))
+			return nil
+		}
+		taskResult.Status = model.TaskStatusSuccess
+		taskResult.Reason = ""
+		taskResult.Url = task.PrivateData.ResultURL
+		taskResult.Progress = taskcommon.ProgressComplete
+		// 上游 rc.39 起终态统一走 finalizeTerminalTask（采样 + 结算 + 失败兜底退款）；
+		// 这里任务是成功态，不会触发退款。
+		finalizeTerminalTask(ctx, adaptor, task, taskResult)
+		return nil
+	}
+
+	if resubmitted {
+		// 重投改掉的是 channel_id / 上游任务 ID / 插件状态，这几个字段都【不在】 taskSnapshot
+		// 的比较范围里（它只比 status/progress/时间/失败原因/结果 URL/data）。
+		// 走下面那套「有没有变化才写」的判断会把它们漏掉，所以这里必须强制落一次库。
+		// ⚠ 请求已经发给新上游了才走到这——CAS 如果输了，那个上游任务会成为孤儿。
+		//   轮询由系统任务租约保证单实例执行，正常不会发生；真发生了下面这条日志能看见。
+		if won, err := task.UpdateWithStatus(snap.Status); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("任务 %s 重投后落库失败：%s（上游新任务可能成为孤儿）", task.TaskID, err.Error()))
+		} else if !won {
+			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 重投后 CAS 落库未命中，说明有别的进程同时改了它（上游新任务可能成为孤儿）", task.TaskID))
+		}
+		return nil
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
