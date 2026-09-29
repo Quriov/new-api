@@ -1,0 +1,120 @@
+# 把改造后的镜像推到 GitHub Packages (ghcr.io)。
+#
+# 为什么是 ghcr: 本仓是公开仓 → ghcr 存储与拉取都免费, 且跟仓库同一套权限,
+# 不用另外管一份 registry 凭据。生产机拉公开镜像不需要登录。
+#
+# ⚠ 这个 workflow 只【推镜像】, 不碰任何生产机。换镜像是另一个动作, 手动做。
+#
+# ⚠ 只在 quriov 分支上跑。main 是纯上游镜像, 推它没有意义 ——
+#    要官方镜像直接用 calciumion/new-api 就行。
+name: Quriov publish image (ghcr)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '额外的 tag(可选)。不填只打 commit sha 和 quriov-latest'
+        required: false
+        type: string
+      export_tarball:
+        description: '同时把镜像导成压缩包当 artifact(给拉不到 registry 的机器用)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [quriov]
+
+concurrency:
+  group: quriov-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build + push ghcr
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 记录这次推的是什么 + 写 VERSION
+        id: meta
+        run: |
+          set -eu
+          SHA="$(git rev-parse --short=12 HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "推的 commit: $(git rev-parse HEAD)"
+          echo "上游冻结点: $(git log --oneline | tail -1)"
+          # ⚠ 必须写 VERSION —— Dockerfile 靠 `-X '...common.Version=$(cat VERSION)'` 注入版本,
+          #   而仓库里那个 VERSION 文件是空的(上游只在它自己的 release 流水线里 `echo TAG > VERSION`)。
+          #   不写的话镜像跑起来 /api/status 的 version 是**空字符串** —— 线上没法一眼看出跑的是哪一版。
+          #   2026-08-26 api.quriov.com 切到 fork 镜像后实测踩到, 见 Quriov-AI-Video#1724。
+          echo "quriov-$SHA" > VERSION
+          echo "VERSION 写入: $(cat VERSION)"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build + push
+        run: |
+          set -eux
+          IMG=ghcr.io/${{ github.repository_owner }}/new-api
+          IMG=$(echo "$IMG" | tr '[:upper:]' '[:lower:]')   # ghcr 只吃小写
+          docker build --progress=plain \
+            -t "$IMG:${{ steps.meta.outputs.sha }}" \
+            -t "$IMG:quriov-latest" \
+            .
+          docker push "$IMG:${{ steps.meta.outputs.sha }}"
+          docker push "$IMG:quriov-latest"
+          if [ -n "${{ inputs.tag }}" ]; then
+            docker tag "$IMG:${{ steps.meta.outputs.sha }}" "$IMG:${{ inputs.tag }}"
+            docker push "$IMG:${{ inputs.tag }}"
+          fi
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+
+      - name: 推上去的东西真的能拉能跑吗
+        run: |
+          set -eux
+          # 只验"推上去的那个 digest 能被拉下来并起得来"。
+          # 不验业务 —— 那是 quriov-build-check 的活, 它在同一个 commit 上已经跑过。
+          docker rmi "$IMG:${{ steps.meta.outputs.sha }}" || true
+          docker pull "$IMG:${{ steps.meta.outputs.sha }}"
+          docker run --rm --entrypoint /bin/sh "$IMG:${{ steps.meta.outputs.sha }}" -c 'test -x /new-api && echo 二进制在'
+
+      # 给拉不到 ghcr 的机器用: 把镜像导成压缩包当 artifact, 下载后 docker load。
+      #
+      # ⚠ 这是【绕路】不是正路。正路是把 ghcr 上那个 package 设成 public
+      #   (本仓公开、镜像由公开源码编译, 不含任何密钥), 那样生产机 docker pull
+      #   就完事。压缩包这条每次都要人搬一次 —— 只在还没设 public 之前用。
+      - name: 导成压缩包 (可选)
+        if: ${{ inputs.export_tarball }}
+        run: |
+          set -eux
+          docker save "$IMG:${{ steps.meta.outputs.sha }}" | gzip -1 > /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+          ls -lh /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+
+      - name: 上传压缩包 (可选)
+        if: ${{ inputs.export_tarball }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-api-image-${{ steps.meta.outputs.sha }}
+          path: /tmp/new-api-${{ steps.meta.outputs.sha }}.tar.gz
+          retention-days: 3
+          compression-level: 0
+
+      - name: 告诉人怎么用
+        run: |
+          echo "### 推好了" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "| tag | 用途 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`$IMG:${{ steps.meta.outputs.sha }}\` | **部署用这个** — 固定到一个 commit，可回滚可追溯 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`$IMG:quriov-latest\` | 只用来看最新，**别拿它部署**（它会漂） |" >> "$GITHUB_STEP_SUMMARY"
