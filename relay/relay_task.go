@@ -258,6 +258,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 	exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 	useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
+	// Quriov 改造 4：TASK_PRICE_PATCH 里列名的型号 = 按次固定价，一律走 ModelPrice。
+	// 上游 rc.37 给 gpt-image-2 / gpt-image-2.5-flare / -sunburst 内置了按 token 的计费表达式，
+	// 并且会顺着【模型映射后的上游名】去找表达式：我们的 gpt-image-2.5-2K/-4K 映射到
+	// gpt-image-2.5-flare，于是被切到 token 表达式，而任务接口没有 token 用量 ⇒ 实测每张扣 0。
+	// 本地对照演练：旧镜像 2K/4K 各扣 180000（¥0.36），rc.40 原样两单都扣 0。
+	perCallPatched := common.StringsContains(constant.TaskPricePatches, modelName)
+	if perCallPatched {
+		useTiered = false
+	}
 	if useTiered {
 		provider, supported := adaptor.(channel.TaskUsageFactsProvider)
 		if billingexpr.UsesFixedPricing(exprStr) {
@@ -305,7 +314,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// 5. 计费估算：让适配器根据用户请求提供 OtherRatios（时长、分辨率等）
 	//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
 	//    ResolveOriginTask 可能已在 remix 路径中预设了 OtherRatios，此处合并。
-	if info.TieredBillingSnapshot == nil {
+	// Quriov 改造 4：按次固定价的型号不做用量估算 —— 第 6 步本来就不乘这些倍率，
+	// 而插件的用量 schema（sora 的 size 只认 4 个视频尺寸）会把图片尺寸判成非法、整单 400。
+	if info.TieredBillingSnapshot == nil && !perCallPatched {
 		var estimatedRatios map[string]float64
 		if validatedProvider, ok := adaptor.(channel.TaskValidatedBillingProvider); ok {
 			estimatedRatios, err = validatedProvider.EstimateBillingValidated(c, info)
@@ -386,7 +397,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				noteTaskQuotaClamp(info, settlement.Clamp)
 			}
 		}
-	} else {
+	} else if !perCallPatched { // Quriov 改造 4：按次固定价不随上游回报的用量调价
 		if adjustedRatios := adaptor.AdjustBillingOnSubmit(info, parsed.TaskData); len(adjustedRatios) > 0 {
 			if adjustedQuota, ok := recalcQuotaFromRatios(info, adjustedRatios); ok {
 				// 基于调整后的 ratios 重新计算 quota

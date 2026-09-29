@@ -121,9 +121,17 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, "image_to_video"); taskErr != nil {
 			return taskErr
 		}
+		// Quriov 改造 4：sora 插件接未认领型号时原样透传 JSON（基本校验照做，见 quriov_compat.go）。
+		if raw, ok := quriovSoraLegacyPassthrough(c, a.plugin); ok {
+			c.Set("task_request", raw)
+		}
 	}
 	request, hasRequest := c.Get("task_request")
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
+	// Quriov 改造 4：按次固定价的型号不拿插件用量 schema 校验（见 quriov_compat.go）。
+	if quriovPerCallPatched(info.OriginModelName) {
+		hasRequest = false
+	}
 	if hasRequest && !hasUsageProfiles {
 		if err := a.validateResolvedUsageRequest(request); err != nil {
 			return service.TaskErrorWrapperLocal(err, "plugin_usage_invalid", http.StatusBadRequest)
