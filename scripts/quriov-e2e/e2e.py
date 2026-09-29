@@ -174,7 +174,7 @@ def main():
             ups = [r for r in records()[before_n:] if r["kind"] == "submit"]
             tid = (resp or {}).get("id") or (resp or {}).get("task_id") if isinstance(resp, dict) else None
             return {"http": code, "resp": resp, "task": tid, "charged": (before_q - after_q) if None not in (before_q, after_q) else None,
-                    "quota_after": after_q, "upstream": ups}
+                    "quota_after": after_q, "upstream": ups, "records_before": before_n}
 
         def wait_done(api, task_id, seconds=150):
             last = None
@@ -262,7 +262,8 @@ def main():
             s = submit(api, cfg["plain_model"], "FAIL_ON_A please", aspect_ratio="16:9", images=["https://ref.mock.invalid/b.png"])
             check("resubmit case: first submission went to primary", s["http"] == 200 and s["upstream"] and s["upstream"][0]["key"] == "sk-mockA", {"http": s["http"]})
             final = wait_done(api, s["task"])
-            recs = records()
+            # 只看本场景开始之后的记录：mock 可能被同一 CI job 里前面的演练共用
+            recs = records()[s["records_before"]:]
             b_subs = [r for r in recs if r["kind"] == "submit" and r["key"] == "sk-mockB"]
             check("resubmit: upstream failure on primary -> resubmitted to backup", len(b_subs) == 1, {"backup_submits": len(b_subs)})
             if b_subs:
