@@ -159,6 +159,17 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
 			bodyMap["model"] = info.UpstreamModelName
 			if newBody, err := common.Marshal(bodyMap); err == nil {
+				// Quriov: 渠道的「参数覆盖」也作用于任务提交体（上游只在同步接口上生效）。
+				// 用途：一个对外型号名映射到上游同一个型号、靠请求参数选档时，
+				// 由渠道配置按 original_model 补上档位参数。见 QURIOV.md 改造 3。
+				// 没配参数覆盖的渠道完全不走这段 —— 请求体与改造前逐字相同。
+				if len(info.ParamOverride) > 0 {
+					overridden, err := relaycommon.ApplyParamOverrideWithRelayInfo(newBody, info)
+					if err != nil {
+						return nil, errors.Wrap(err, "apply_param_override_failed")
+					}
+					return bytes.NewReader(overridden), nil
+				}
 				return bytes.NewReader(newBody), nil
 			}
 		}
