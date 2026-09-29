@@ -174,3 +174,40 @@ ORDER BY created_at DESC LIMIT 20;
 `service/task_resubmit_test.go` 里的同步腿一组（5 条）。
 其中最硬的一条是 `TestSyncRelayChannel_IsInvisibleToNormalRouting` ——
 把同步腿的优先级**故意设成最高**，断言正常路由仍然选不到它。
+
+### 3. 渠道「参数覆盖」也作用于异步任务提交体（2026-09-29）
+
+**治的问题**：有的上游把几个分辨率档做成**同一个型号**、靠请求参数选档（例如同一型号出 1K/2K/4K，
+用 `image_size` 区分）。我们对外仍想按档卖不同的型号名（便于定价、跟其它渠道口径一致），
+这就需要「改型号名 + 补一个档位参数」。改名靠渠道的**模型映射**，本来就能用；
+补参数本该靠渠道的**参数覆盖**（`param_override`）—— 但上游 new-api 只在同步接口上执行它，
+**异步任务（`/v1/videos`）这条路上它是摆设**，配了也不生效。
+
+**做了什么**：`relay/channel/task/sora/adaptor.go` 的 JSON 请求体分支，在换完型号名之后
+调用上游现成的 `ApplyParamOverrideWithRelayInfo`。没有新造任何配置格式，用的就是后台渠道编辑页里
+那个「参数覆盖」框。首次提交、渠道重试、改造 1 的换渠道重投都经过这个函数，所以三条路一致。
+
+**刻意不做的**：
+
+- **没配参数覆盖的渠道完全不走这段** —— 请求体与改造前逐字相同（有回归测试守着）。
+- **multipart 请求体不处理** —— 参数覆盖是 JSON 路径语义，表单上没有对应物。
+- **本仓不写任何具体型号名 / 档位映射** —— 那是生产配置，放在渠道的参数覆盖里（数据库），不进公开仓。
+
+**配置写法（形状示例，型号名是占位）**：对外名 `img-x-2K` 映射到上游 `img-x-tiered`，
+且只在客户**没自己给** `size` / `resolution` / `image_size` 时补档位：
+
+```json
+{"operations":[
+  {"path":"image_size","mode":"set","value":"2K","keep_origin":true,"logic":"AND",
+   "conditions":[
+     {"path":"original_model","mode":"full","value":"img-x-2K"},
+     {"path":"size","mode":"prefix","value":"","invert":true,"pass_missing_key":true},
+     {"path":"resolution","mode":"prefix","value":"","invert":true,"pass_missing_key":true}]}
+]}
+```
+
+`original_model` 不在请求体里，条件判断会回落到上游提供的上下文（`BuildParamOverrideContext`），
+取到的是客户填的型号名；`keep_origin` 保住客户自己传的 `image_size`。
+
+**测试**：`relay/channel/task/sora/adaptor_param_override_test.go`（5 条）：按档补参数、
+尊重客户自带档位、不碰同渠道其它型号、无配置时行为不变、`return_error` 在出门前就失败。
