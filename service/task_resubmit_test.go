@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	appdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
@@ -108,7 +109,7 @@ func newFailedTask(onChannel int) *model.Task {
 		Group:     testResubmitGroup,
 		ChannelId: onChannel,
 		Platform:  constant.TaskPlatform("1"),
-		Action:    constant.TaskActionTextGenerate,
+		Action:    constant.TaskActionTextToVideo,
 		Quota:     1000,
 		// ⚠ 必须是 FAILURE，不能图省事写 IN_PROGRESS：
 		//   轮询代码在进失败分支【之前】就已经把 task.Status 置成上游返回的
@@ -135,9 +136,9 @@ func TestResubmit_SwitchesToAnotherChannelWhenUpstreamFails(t *testing.T) {
 	model.InitChannelCache()
 
 	var calledOnChannel int
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, ch *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, ch *model.Channel) (*ResubmitSubmission, error) {
 		calledOnChannel = ch.Id
-		return "upstream-new", []byte(`{"id":"upstream-new"}`), constant.TaskPlatform("1"), nil
+		return &ResubmitSubmission{UpstreamTaskID: "upstream-new", TaskData: []byte(`{"id":"upstream-new"}`), Platform: constant.TaskPlatform("1")}, nil
 	}
 
 	task := newFailedTask(2)
@@ -167,9 +168,9 @@ func TestResubmit_ContentPolicyFailureIsNotRetried(t *testing.T) {
 	model.InitChannelCache()
 
 	called := false
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (*ResubmitSubmission, error) {
 		called = true
-		return "should-not-happen", nil, "", nil
+		return &ResubmitSubmission{UpstreamTaskID: "should-not-happen"}, nil
 	}
 
 	task := newFailedTask(2)
@@ -236,9 +237,9 @@ func TestResubmit_DeclinesWhenNoOtherChannelAvailable(t *testing.T) {
 	model.InitChannelCache()
 
 	called := false
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (*ResubmitSubmission, error) {
 		called = true
-		return "x", nil, "", nil
+		return &ResubmitSubmission{UpstreamTaskID: "x"}, nil
 	}
 
 	task := newFailedTask(2)
@@ -255,8 +256,8 @@ func TestResubmit_MarksChannelTriedWhenResubmitCallItselfFails(t *testing.T) {
 	seedResubmitChannel(t, db, 3, 0)
 	model.InitChannelCache()
 
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (string, []byte, constant.TaskPlatform, error) {
-		return "", nil, "", fmt.Errorf("上游 503")
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (*ResubmitSubmission, error) {
+		return nil, fmt.Errorf("上游 503")
 	}
 
 	task := newFailedTask(2)
@@ -274,8 +275,8 @@ func TestResubmit_FollowsNewChannelPlatformSoPollingUsesRightAdaptor(t *testing.
 	seedResubmitChannel(t, db, 3, 0)
 	model.InitChannelCache()
 
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (string, []byte, constant.TaskPlatform, error) {
-		return "upstream-new", nil, constant.TaskPlatform("33"), nil
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, _ *model.Channel) (*ResubmitSubmission, error) {
+		return &ResubmitSubmission{UpstreamTaskID: "upstream-new", Platform: constant.TaskPlatform("33")}, nil
 	}
 
 	task := newFailedTask(2)
@@ -462,7 +463,7 @@ func TestSyncRelayChannel_IsInvisibleToNormalRouting(t *testing.T) {
 
 	picked := map[int]bool{}
 	for tier := 0; tier < 4; tier++ {
-		ch, err := model.GetRandomSatisfiedChannel(testResubmitGroup, testResubmitModel, tier, testResubmitPath)
+		ch, err := model.GetRandomSatisfiedChannel(testResubmitGroup, testResubmitModel, tier, []appdto.ChannelFilter{{Kind: appdto.FilterRequestPath, RequestPath: testResubmitPath}})
 		require.NoError(t, err)
 		if ch == nil {
 			continue
@@ -512,9 +513,9 @@ func TestResubmit_SyncRelayCompletesTheTaskImmediately(t *testing.T) {
 		gotChannel = ch.Id
 		return "https://oss.example.top/u/final.png", []byte(`{"ok":true}`), nil
 	}
-	ResubmitTaskFunc = func(context.Context, *model.Task, *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(context.Context, *model.Task, *model.Channel) (*ResubmitSubmission, error) {
 		t.Fatal("同步腿不该走异步重投那条路")
-		return "", nil, "", nil
+		return nil, nil
 	}
 
 	task := newFailedTask(2)

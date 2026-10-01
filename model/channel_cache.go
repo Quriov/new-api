@@ -11,8 +11,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
-	"github.com/QuantumNous/new-api/relaykit/dto"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
 
@@ -20,16 +21,17 @@ var group2model2channels map[string]map[string][]int // enabled channel
 var channelsIDM map[int]*Channel                     // all channels include disabled
 // channel2advancedCustomConfig caches parsed Advanced Custom (type 58) configs so
 // path-aware selection avoids re-parsing JSON per request. Refreshed on full sync.
-var channel2advancedCustomConfig map[int]*dto.AdvancedCustomConfig
+var channel2advancedCustomConfig map[int]*kitdto.AdvancedCustomConfig
 var channelSyncLock sync.RWMutex
 
 func InitChannelCache() {
 	if !common.MemoryCacheEnabled {
 		InvalidatePricingCache()
+		rebuildTaskAliasView()
 		return
 	}
 	newChannelId2channel := make(map[int]*Channel)
-	newChannel2advancedCustomConfig := make(map[int]*dto.AdvancedCustomConfig)
+	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
 	var channels []*Channel
 	DB.Find(&channels)
 	for _, channel := range channels {
@@ -54,9 +56,9 @@ func InitChannelCache() {
 		if channel.Status != common.ChannelStatusEnabled {
 			continue // skip disabled channels
 		}
-		groups := strings.Split(channel.Group, ",")
-		for _, group := range groups {
-			models := strings.Split(channel.Models, ",")
+		groups := strings.SplitSeq(channel.Group, ",")
+		for group := range groups {
+			models := channel.GetModels()
 			for _, model := range models {
 				if _, ok := newGroup2model2channels[group][model]; !ok {
 					newGroup2model2channels[group][model] = make([]int, 0)
@@ -100,6 +102,7 @@ func InitChannelCache() {
 	// loadPricingAdvancedCustomConfigs. channelSyncLock MUST be released before
 	// invalidating the pricing cache, otherwise the reversed order deadlocks.
 	InvalidatePricingCache()
+	rebuildTaskAliasView()
 	common.SysLog("channels synced from database")
 }
 
@@ -111,22 +114,27 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
-func GetRandomSatisfiedChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+func GetRandomSatisfiedChannel(
+	group string,
+	model string,
+	retry int,
+	filters []dto.ChannelFilter,
+) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, requestPath)
+		return GetChannel(group, model, retry, filters)
 	}
 
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
-	channels := filterChannelsByRequestPathAndModel(group2model2channels[group][model], requestPath, model)
+	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
-		normalizedModel := ratio_setting.FormatMatchingModelName(model)
-		channels = filterChannelsByRequestPathAndModel(group2model2channels[group][normalizedModel], requestPath, model)
+		normalizedModel := ratio_setting.RoutingMatchModelName(model)
+		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
 	}
 
 	if len(channels) == 0 {
@@ -208,45 +216,6 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	return nil, errors.New("channel not found")
 }
 
-// filterChannelsByRequestPathAndModel restricts candidates by request path and
-// model. Only Advanced Custom (type 58) channels are path-checked: they are kept
-// only when one of their configured routes matches requestPath and model. All
-// other channel types always pass. When requestPath is empty, filtering is skipped.
-// Caller must hold channelSyncLock (read lock). The cached slice is never mutated.
-func filterChannelsByRequestPathAndModel(channels []int, requestPath string, model string) []int {
-	if len(channels) == 0 {
-		return channels
-	}
-	filtered := make([]int, 0, len(channels))
-	for _, channelId := range channels {
-		channel, ok := channelsIDM[channelId]
-		if !ok {
-			// keep it so the downstream consistency error is raised as before
-			filtered = append(filtered, channelId)
-			continue
-		}
-		// Quriov 改造: 只有同步出图接口的渠道对【正常路由】不可见。
-		// 客户走的是异步任务接口, 把请求发给它必然失败 —— 让它进正常路由等于
-		// 主动制造故障。它只在「任务失败后换渠道重投」那条路上被 GetSyncRelayChannels
-		// 单独挑出来用, 那条路跑在后台、可以等同步调用几十秒。
-		if channel.GetSetting().QuriovSyncImageRelay {
-			continue
-		}
-		if requestPath == "" {
-			filtered = append(filtered, channelId)
-			continue
-		}
-		if channel.Type != constant.ChannelTypeAdvancedCustom {
-			filtered = append(filtered, channelId)
-			continue
-		}
-		if config := channel2advancedCustomConfig[channelId]; config != nil && config.SupportsPathForModel(requestPath, model) {
-			filtered = append(filtered, channelId)
-		}
-	}
-	return filtered
-}
-
 func CacheGetChannel(id int) (*Channel, error) {
 	if !common.MemoryCacheEnabled {
 		return GetChannelById(id, true)
@@ -322,7 +291,7 @@ func CacheUpdateChannel(channel *Channel) {
 	}
 	channelsIDM[channel.Id] = channel
 	if channel2advancedCustomConfig == nil {
-		channel2advancedCustomConfig = make(map[int]*dto.AdvancedCustomConfig)
+		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)
 	}
 	delete(channel2advancedCustomConfig, channel.Id)
 	if channel.Type == constant.ChannelTypeAdvancedCustom {
@@ -339,9 +308,9 @@ func CacheUpdateChannel(channel *Channel) {
 	InvalidatePricingCache()
 }
 
-// GetSyncRelayChannels 返回某分组下能出这个模型、且被标记为【只有同步接口】的渠道。
+// GetSyncRelayChannels 返回某分组下能出这个模型、且被标记为【只有同步接口】的渠道（Quriov 改造）。
 //
-// 这些渠道对正常路由是不可见的(见 filterChannelsByRequestPathAndModel)——
+// 这些渠道对正常路由是不可见的(见 channel_constraint.go 的 isSyncRelayOnly)——
 // 客户走异步任务接口, 发给它们必然失败。它们的唯一用途是给
 // 「任务失败后换渠道重投」当备用腿: 那条路跑在后台轮询协程里, 前面没有客户的
 // HTTP 连接、也没有网关超时, 同步等几十秒完全可以。
@@ -352,10 +321,11 @@ func GetSyncRelayChannels(group string, modelName string) []*Channel {
 	if !common.MemoryCacheEnabled {
 		// 内存缓存关掉时直接查库 —— 这条路很冷(只在重投时走), 不做缓存也不心疼。
 		var channels []*Channel
-		//: `group` 是 SQL 保留字, 必须加引号 —— 不加在 sqlite/MySQL 上都是语法错误,
-		//: 而这个函数吞掉 err 返回 nil, 表现是"没有同步腿可换"(静默)。
+		// `group` 是 SQL 保留字, 用上游统一的 commonGroupCol(MySQL/SQLite 反引号、PG 双引号)。
+		// 不加引号在 sqlite/MySQL 上都是语法错误, 而这个函数吞掉 err 返回 nil,
+		// 表现是"没有同步腿可换"(静默)。
 		err := DB.Joins("JOIN abilities ON abilities.channel_id = channels.id").
-			Where("abilities.`group` = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
+			Where("abilities."+commonGroupCol+" = ? AND abilities.model = ? AND abilities.enabled = ?", group, modelName, true).
 			Find(&channels).Error
 		if err != nil {
 			common.SysLog("GetSyncRelayChannels 查库失败, 本次当作没有同步腿可换: " + err.Error())
@@ -363,7 +333,7 @@ func GetSyncRelayChannels(group string, modelName string) []*Channel {
 		}
 		out := make([]*Channel, 0, len(channels))
 		for _, ch := range channels {
-			if ch.GetSetting().QuriovSyncImageRelay {
+			if ch.Status == common.ChannelStatusEnabled && isSyncRelayOnly(ch) {
 				out = append(out, ch)
 			}
 		}
@@ -375,12 +345,12 @@ func GetSyncRelayChannels(group string, modelName string) []*Channel {
 
 	ids := group2model2channels[group][modelName]
 	if len(ids) == 0 {
-		normalized := ratio_setting.FormatMatchingModelName(modelName)
+		normalized := ratio_setting.RoutingMatchModelName(modelName)
 		ids = group2model2channels[group][normalized]
 	}
 	out := make([]*Channel, 0, 2)
 	for _, id := range ids {
-		if ch, ok := channelsIDM[id]; ok && ch.GetSetting().QuriovSyncImageRelay {
+		if ch, ok := channelsIDM[id]; ok && isSyncRelayOnly(ch) {
 			out = append(out, ch)
 		}
 	}

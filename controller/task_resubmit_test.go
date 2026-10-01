@@ -14,7 +14,7 @@ func TestResubmitTaskOnChannelBuildsChannelMetaBeforeUsingIt(t *testing.T) {
 		TaskID:   "task_resubmit_channel_meta",
 		UserId:   9,
 		Group:    "default",
-		Action:   constant.TaskActionTextGenerate,
+		Action:   constant.TaskActionTextToVideo,
 		Platform: constant.TaskPlatform("unknown"),
 	}
 	task.Properties.OriginModelName = "gpt-image-2"
@@ -34,7 +34,9 @@ func TestResubmitTaskOnChannelBuildsChannelMetaBeforeUsingIt(t *testing.T) {
 
 	var err error
 	require.NotPanics(t, func() {
-		_, _, _, err = ResubmitTaskOnChannel(context.Background(), task, channel)
+		_, err = ResubmitTaskOnChannel(context.Background(), task, channel)
 	})
-	require.ErrorContains(t, err, "找不到平台")
+	// 能走到「按新渠道类型解析插件」这一步、并且因为渠道类型未知而明确报错，
+	// 说明渠道元数据初始化之前没有解引用（#11 那个空指针）。
+	require.ErrorContains(t, err, "新渠道没有可用的任务插件")
 }

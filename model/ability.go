@@ -3,12 +3,12 @@ package model
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/dto"
 
 	"github.com/samber/lo"
 	"gorm.io/gorm"
@@ -63,16 +63,9 @@ func GetAllEnableAbilities() []Ability {
 func getPriority(group string, model string, retry int) (int, error) {
 
 	var priorities []int
-	// Quriov 改造: 同步腿不参与优先级档位的计算。
-	// 让它进来的话, 档位表里会多出一档只有它的档 —— 那一档被过滤空之后,
-	// 重试次数就白白消耗在一个空档上, 正常渠道可能永远轮不到。
-	q := DB.Model(&Ability{}).
+	err := DB.Model(&Ability{}).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	if excluded := syncRelayChannelIDs(); len(excluded) > 0 {
-		q = q.Where("channel_id NOT IN ?", excluded)
-	}
-	err := q.
+		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -97,72 +90,55 @@ func getPriority(group string, model string, retry int) (int, error) {
 	return priorityToUse, nil
 }
 
-// syncRelayChannelIDs 返回被标记为「只有同步接口」的渠道 ID（Quriov 改造）。
-//
-// ⚠ 为什么要在【算优先级档位之前】就把它们排掉, 而不是查出来再过滤:
-//
-//	优先级档位是在 SQL 里用 MAX(priority) 算的。如果一个同步腿的优先级最高,
-//	它会独占最高档 —— 之后再把它过滤掉, 那一档就空了, 结果是"无可用渠道",
-//	**优先级更低的正常渠道根本轮不到**。
-//	2026-08-25 在真库上实测撞到: 同步腿 priority=999、正常渠道 priority=10,
-//	正常请求直接报无可用渠道 = 全站故障。
-//	内存缓存那条路没这个问题(它先过滤再算档位), 所以只有这边需要这一步。
-func syncRelayChannelIDs() []int {
-	var channels []*Channel
-	if err := DB.Select("id, setting").Find(&channels).Error; err != nil {
-		common.SysLog("syncRelayChannelIDs 查库失败, 本次不排除同步腿: " + err.Error())
-		return nil
-	}
-	ids := make([]int, 0, 2)
-	for _, ch := range channels {
-		if ch.GetSetting().QuriovSyncImageRelay {
-			ids = append(ids, ch.Id)
-		}
-	}
-	return ids
-}
-
 func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	// Quriov 改造: 同步腿在【算优先级档位之前】就排掉, 理由见 syncRelayChannelIDs。
-	excluded := syncRelayChannelIDs()
-	base := func() *gorm.DB {
-		q := DB.Model(&Ability{}).Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-		if len(excluded) > 0 {
-			q = q.Where("channel_id NOT IN ?", excluded)
-		}
-		return q
-	}
-	maxPrioritySubQuery := base().Select("MAX(priority)")
-	channelQuery := base().Where("priority = (?)", maxPrioritySubQuery)
+	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
 	if retry != 0 {
 		priority, err := getPriority(group, model, retry)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = base().Where("priority = ?", priority)
+			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
 		}
 	}
 
 	return channelQuery, nil
 }
 
-func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+func GetChannel(
+	group string,
+	model string,
+	retry int,
+	filters []dto.ChannelFilter,
+) (*Channel, error) {
 	var abilities []Ability
-
-	var err error = nil
-	channelQuery, err := getChannelQuery(group, model, retry)
+	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
 	if err != nil {
 		return nil, err
 	}
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) || common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	} else {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
+	abilities = filterAbilitiesByConstraints(abilities, model, filters)
+	if len(abilities) > 0 {
+		priorities := make([]int64, 0)
+		seen := make(map[int64]bool)
+		for _, ability := range abilities {
+			priority := int64(0)
+			if ability.Priority != nil {
+				priority = *ability.Priority
+			}
+			if !seen[priority] {
+				seen[priority] = true
+				priorities = append(priorities, priority)
+			}
+		}
+		sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+		if retry >= len(priorities) {
+			retry = len(priorities) - 1
+		}
+		targetPriority := priorities[retry]
+		abilities = lo.Filter(abilities, func(ability Ability, _ int) bool {
+			return ability.Priority == nil && targetPriority == 0 || ability.Priority != nil && *ability.Priority == targetPriority
+		})
 	}
-	if err != nil {
-		return nil, err
-	}
-	abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
 	channel := Channel{}
 	if len(abilities) > 0 {
 		// Randomly choose one
@@ -187,14 +163,12 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 	return &channel, err
 }
 
-// filterAbilitiesByRequestPathAndModel restricts candidates by request path and
-// model for the DB (non-memory-cache) selection path. Only Advanced Custom
-// (type 58) channels are path-checked: kept only when one of their routes matches
-// requestPath and model; all other channel types always pass. When requestPath is
-// empty, filtering is skipped.
-func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath string, model string) []Ability {
+// filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
+// predicate used by the memory-cache path. A failed channel lookup fails
+// closed when a task-plugin identity is required and fails open otherwise.
+func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
 	if len(abilities) == 0 {
-		return abilities
+		return nil
 	}
 
 	channelIds := make([]int, 0, len(abilities))
@@ -209,48 +183,34 @@ func filterAbilitiesByRequestPathAndModel(abilities []Ability, requestPath strin
 
 	var channels []*Channel
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
-		// On error, fall back to unfiltered candidates to avoid blocking selection
+		if identityFilterRequiresKey(filters) {
+			return nil
+		}
 		return abilities
 	}
 
-	advancedConfigs := make(map[int]*dto.AdvancedCustomConfig)
+	channelsByID := make(map[int]*Channel, len(channels))
 	for _, channel := range channels {
-		if channel.Type == constant.ChannelTypeAdvancedCustom {
-			advancedConfigs[channel.Id] = channel.GetOtherSettings().AdvancedCustom
-		}
-	}
-
-	// Quriov 改造: 只有同步出图接口的渠道对【正常路由】不可见。
-	// 跟 filterChannelsByRequestPathAndModel 里那段是同一条规则 ——
-	// ⚠ 两个地方都要有: 内存缓存开着走那边, 关着走这边。
-	//   生产是【关着】的, 所以只改那一边等于没改(2026-08-25 实测撞到:
-	//   单测把 MemoryCacheEnabled 设成 true 所以全绿, 真跑起来同步腿照样被选中)。
-	syncRelayOnly := make(map[int]bool, len(channels))
-	for _, channel := range channels {
-		if channel.GetSetting().QuriovSyncImageRelay {
-			syncRelayOnly[channel.Id] = true
-		}
+		channelsByID[channel.Id] = channel
 	}
 
 	filtered := make([]Ability, 0, len(abilities))
 	for _, ability := range abilities {
-		if syncRelayOnly[ability.ChannelId] {
-			continue
-		}
-		config, isAdvancedCustom := advancedConfigs[ability.ChannelId]
-		if !isAdvancedCustom {
-			filtered = append(filtered, ability)
-			continue
-		}
-		if requestPath == "" {
-			filtered = append(filtered, ability)
-			continue
-		}
-		if config != nil && config.SupportsPathForModel(requestPath, model) {
+		channel := channelsByID[ability.ChannelId]
+		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
 			filtered = append(filtered, ability)
 		}
 	}
 	return filtered
+}
+
+func identityFilterRequiresKey(filters []dto.ChannelFilter) bool {
+	for _, filter := range filters {
+		if filter.Kind == dto.FilterTaskPluginIdentity && filter.TaskPluginKey != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (channel *Channel) AddAbilities(tx *gorm.DB) error {
@@ -326,7 +286,7 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	}
 
 	// Then add new abilities
-	models_ := strings.Split(channel.Models, ",")
+	models_ := channel.GetModels()
 	groups_ := strings.Split(channel.Group, ",")
 	abilitySet := make(map[string]struct{})
 	abilities := make([]Ability, 0, len(models_))

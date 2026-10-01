@@ -22,14 +22,15 @@ jobs:
   build:
     name: docker build + 真跑一遍
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
 
     services:
       mysql:
         # 跟生产 api 站同一种库 —— 用 SQLite 跑绿是另一回事, 证明不了生产能换。
-        image: mysql:8.0
+        image: mysql:8.4  # 跟生产同一个大版本（09-29 核：生产 newapi-mysql = mysql:8.4）
         env:
           MYSQL_ROOT_PASSWORD: buildcheck
           MYSQL_DATABASE: newapi
@@ -93,12 +94,12 @@ jobs:
         run: |
           set -eux
           # 空跑不连库也能给 200 —— 必须确认它真往库里写了东西。
-          TABLES=$(docker run --rm --network host mysql:8.0 \
+          TABLES=$(docker run --rm --network host mysql:8.4 \
             mysql -h127.0.0.1 -uroot -pbuildcheck -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='newapi';" 2>/dev/null)
           echo "newapi 库里有 ${TABLES} 张表"
           [ "$TABLES" -gt 10 ] || { echo "::error::表建少了(${TABLES}), 说明它没真连上库"; exit 1; }
           # tasks 表必须有 private_data 列 —— 换渠道重投的留存字段住在里面。
-          docker run --rm --network host mysql:8.0 \
+          docker run --rm --network host mysql:8.4 \
             mysql -h127.0.0.1 -uroot -pbuildcheck -N -e "SHOW COLUMNS FROM newapi.tasks LIKE 'private_data';" 2>/dev/null | grep -q private_data \
             || { echo "::error::tasks 表没有 private_data 列"; exit 1; }
 
@@ -125,10 +126,109 @@ jobs:
             || { echo "::error::把开关关掉之后日志没变 —— 上一步那条判据是恒真的"; exit 1; }
           docker rm -f newapi-check-off 2>/dev/null || true
 
+      # ── 2026-09-29 补：改造回归演练 + 换镜像演练（rc.25 → rc.40 升级时加的）──────────────
+      # 为什么：升级 rc.40 时，本地对照演练在 rc.40 原样上抓到三处客户可见的回归（字段被丢、
+      # 图片尺寸被拒、扣 0 元），单测一条都没抓到 —— 它们只在「真 HTTP → 真路由 → 真计价」里出现。
+      # 这里把那套演练搬进 CI：mock 上游 + 真容器 + 真 MySQL，跟生产同一种库、同一个大版本。
+
+      - name: 起 mock 上游（只在 runner 本机，不连任何真上游）
+        run: |
+          set -eux
+          nohup python3 scripts/quriov-e2e/mock_upstream.py 18090 > /tmp/mock.log 2>&1 &
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:18090/_records >/dev/null && break; sleep 1; done
+
+      - name: 改造回归演练（新镜像，独立库 newapi_e2e）
+        run: |
+          set -eux
+          docker run --rm --network host mysql:8.4 mysql -h127.0.0.1 -uroot -pbuildcheck -e "CREATE DATABASE newapi_e2e;"
+          docker run -d --name newapi-e2e --network host \
+            -e SQL_DSN='root:buildcheck@tcp(127.0.0.1:3306)/newapi_e2e' \
+            -e PORT=3002 -e TZ=Asia/Shanghai \
+            -e SESSION_SECRET=e2e-session-secret-not-real -e CRYPTO_SECRET=e2e-crypto-secret-not-real \
+            -e TASK_PRICE_PATCH=img-std,img-tier-2K,img-tier-4K \
+            quriov/new-api:buildcheck
+          python3 scripts/quriov-e2e/e2e.py --phase full --base http://127.0.0.1:3002 --mock-port 18090 \
+            --state /tmp/e2e-state.json --report /tmp/e2e-report.json
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 换镜像演练 —— 旧生产镜像建库 → 新镜像接管 → 再换回旧镜像
+        env:
+          # 当前生产镜像。升级上线后把这里改成新的生产 tag。
+          OLD_IMAGE: ghcr.io/quriov/new-api:e0483aa103d6
+        run: |
+          set -eux
+          docker run --rm --network host mysql:8.4 mysql -h127.0.0.1 -uroot -pbuildcheck -e "CREATE DATABASE newapi_swap;"
+          docker pull "$OLD_IMAGE"
+          start() {  # $1=容器名 $2=镜像
+            docker rm -f "$1" 2>/dev/null || true
+            docker run -d --name "$1" --network host \
+              -e SQL_DSN='root:buildcheck@tcp(127.0.0.1:3306)/newapi_swap' \
+              -e PORT=3003 -e TZ=Asia/Shanghai \
+              -e SESSION_SECRET=swap-session-secret-not-real -e CRYPTO_SECRET=swap-crypto-secret-not-real \
+              -e TASK_PRICE_PATCH=img-std,img-tier-2K,img-tier-4K \
+              "$2"
+          }
+          schema() {  # 只导表结构，去掉自增计数，方便 diff
+            docker run --rm --network host mysql:8.4 mysqldump -h127.0.0.1 -uroot -pbuildcheck \
+              --no-data --skip-comments --skip-dump-date newapi_swap 2>/dev/null \
+              | sed -E 's/ AUTO_INCREMENT=[0-9]+//' > "$1"
+          }
+          # 1) 旧镜像建库并造数据（渠道、令牌、任务、账单）
+          start swap-old "$OLD_IMAGE"
+          python3 scripts/quriov-e2e/e2e.py --phase full --base http://127.0.0.1:3003 --mock-port 18090 \
+            --state /tmp/swap-state.json --report /tmp/swap-old-full.json
+          schema /tmp/schema-old.sql
+          docker logs swap-old > /tmp/swap-old.log 2>&1; docker rm -f swap-old
+          # 2) 新镜像接管同一个库（= 生产上线那一刻）
+          start swap-new quriov/new-api:buildcheck
+          python3 scripts/quriov-e2e/e2e.py --phase smoke --base http://127.0.0.1:3003 --mock-port 18090 \
+            --state /tmp/swap-state.json --report /tmp/swap-new-smoke.json
+          schema /tmp/schema-new.sql
+          docker logs swap-new > /tmp/swap-new.log 2>&1; docker rm -f swap-new
+          # 3) 换回旧镜像（= 不恢复备份、只换镜像的回滚）
+          start swap-back "$OLD_IMAGE"
+          python3 scripts/quriov-e2e/e2e.py --phase smoke --base http://127.0.0.1:3003 --mock-port 18090 \
+            --state /tmp/swap-state.json --report /tmp/swap-back-smoke.json
+          schema /tmp/schema-back.sql
+          docker logs swap-back > /tmp/swap-back.log 2>&1; docker rm -f swap-back
+
+      - name: 表结构变化（旧 → 新 → 换回旧）
+        if: always()
+        run: |
+          echo "### 旧镜像 → 新镜像 自动迁移改了什么" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+          diff -u /tmp/schema-old.sql /tmp/schema-new.sql | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### 换回旧镜像后，旧镜像又改了什么（空 = 旧镜像不碰新结构）" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+          diff -u /tmp/schema-new.sql /tmp/schema-back.sql | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### 新镜像启动日志里的错误行" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -iE 'error|fail|panic' /tmp/swap-new.log | grep -viE 'error_log|ERROR_LOG' | head -40 | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: 留存演练产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quriov-rehearsal
+          path: |
+            /tmp/e2e-report.json
+            /tmp/swap-*.json
+            /tmp/schema-*.sql
+            /tmp/swap-*.log
+            /tmp/mock.log
+          retention-days: 14
+          if-no-files-found: ignore
+
       - name: 出问题时把日志留下
         if: always()
         run: docker logs newapi-check 2>&1 | tail -120 || true
 
       - name: 收摊
         if: always()
-        run: docker rm -f newapi-check newapi-check-off 2>/dev/null || true
+        run: docker rm -f newapi-check newapi-check-off newapi-e2e swap-old swap-new swap-back 2>/dev/null || true

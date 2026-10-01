@@ -12,8 +12,8 @@ import (
 // 任务落了库，之后无论上游怎么失败都不会再换渠道。实测某天 28 次任务失败
 // 全部落在同一个渠道上，旁边配好的备用渠道一次都没被试过。
 //
-// ⚠ 这些字段一律存在 TaskPrivateData 里（不返回给用户），且只用可比较类型，
-//   因为 TaskPrivateData.Value() 用结构体 == 判空。
+// ⚠ 这些字段一律存在 TaskPrivateData 里（不返回给用户）。
+//   TaskPrivateData.Value() 是逐字段判空的（上游 rc.28 起），加字段要同步改那里。
 
 // TriedChannelIDs 返回这个任务已经试过的渠道 ID（含首次提交那个）。
 func (t *Task) TriedChannelIDs() []int {

@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/dto"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,10 +18,10 @@ import (
 //
 // 为什么这条值得单独一个文件
 // --------------------------
-// 渠道选择在 new-api 里有【两个实现】:
+// 渠道选择在 new-api 里有【两个实现】(上游 rc.31 起统一成「过滤器」形式, 但仍是两条路):
 //
-//	MemoryCacheEnabled=true  → channel_cache.go 的 filterChannelsByRequestPathAndModel
-//	MemoryCacheEnabled=false → ability.go       的 filterAbilitiesByRequestPathAndModel
+//	MemoryCacheEnabled=true  → channel_cache.go 的 filterCandidateIDs
+//	MemoryCacheEnabled=false → ability.go       的 filterAbilitiesByConstraints → ChannelSatisfiesFilters
 //
 // **生产是 false**(MEMORY_CACHE_ENABLED 没配 = 默认关)。
 //
@@ -29,21 +30,23 @@ import (
 // (日志原文 `channel error (channel #99, status code: 400)`)。
 // ⇒ 判据只在你【不关心】的那种情况下成立, 等于没有判据。
 //
-// ⚠ 本文件直接测两个过滤函数, 不走 GetRandomSatisfiedChannel ——
-//   因为 DB 那条路的查询在 sqlite 上本来就报语法错误(上游自带, 与本改动无关),
-//   端到端只能拿真 MySQL 验(见 QURIOV.md 的迁移演练一节)。
-//   把这句写下来是为了**不让人误以为 DB 那条路已经端到端覆盖了**。
+// 上游 rc.31 把 DB 那条路改成「先把候选全查出来、在 Go 里过滤、过滤之后再算优先级档位」,
+// 所以 08-25 第二个事故(同步腿优先级最高 → 独占最高档 → 过滤后那档空了 → 全站无渠道)
+// 在结构上已经不可能了。下面仍然保留那条测试, 并且改成端到端走 GetChannel —— 这回
+// sqlite 上也能跑通了(上游不再用那条在 sqlite 上报语法错的子查询)。
 
 func setupVisibilityTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	origDB, origCache := DB, common.MemoryCacheEnabled
+	origDB, origCache, origGroupCol := DB, common.MemoryCacheEnabled, commonGroupCol
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
 	DB = db
+	commonGroupCol = "`group`"
+	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
-		DB, common.MemoryCacheEnabled = origDB, origCache
+		DB, common.MemoryCacheEnabled, commonGroupCol = origDB, origCache, origGroupCol
 		if sqlDB, err := db.DB(); err == nil {
 			_ = sqlDB.Close()
 		}
@@ -67,29 +70,42 @@ func primeChannelCache(t *testing.T, ids ...int) {
 	t.Cleanup(func() { channelsIDM = orig })
 }
 
-func seedVisibilityChannel(t *testing.T, db *gorm.DB, id int, syncRelay bool) {
+// seedVisibilityChannel 建一个渠道 + 它在 default/gpt-image-2 上的路由行。
+func seedVisibilityChannel(t *testing.T, db *gorm.DB, id int, priority int64, syncRelay bool) {
 	t.Helper()
-	p, w := int64(0), uint(100)
+	p, w := priority, uint(100)
 	ch := &Channel{
 		Id: id, Type: 1, Key: fmt.Sprintf("k%d", id), Status: common.ChannelStatusEnabled,
 		Name: fmt.Sprintf("ch%d", id), Weight: &w, Models: "gpt-image-2",
 		Group: "default", Priority: &p,
 	}
 	if syncRelay {
-		ch.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
+		ch.SetSetting(kitdto.ChannelSettings{QuriovSyncImageRelay: true})
 	}
 	require.NoError(t, db.Create(ch).Error)
+	require.NoError(t, db.Create(&Ability{
+		Group: "default", Model: "gpt-image-2", ChannelId: id,
+		Enabled: true, Priority: &p, Weight: 100,
+	}).Error)
 }
 
-// ⭐ DB 那条路（生产走的就是这条）
+func pathFilters(path string) []dto.ChannelFilter {
+	if path == "" {
+		return nil
+	}
+	return []dto.ChannelFilter{{Kind: dto.FilterRequestPath, RequestPath: path}}
+}
+
+// ⭐ DB 那条路（生产走的就是这条）。带不带过滤器都得排除 —— 上游在没有过滤器时
+// 不会进过滤循环, 只挂在过滤器里的排除会在「没过滤器」那一支上漏掉。
 func TestFilterAbilities_ExcludesSyncRelayChannels(t *testing.T) {
 	db := setupVisibilityTestDB(t)
-	seedVisibilityChannel(t, db, 2, false) // 正常异步渠道
-	seedVisibilityChannel(t, db, 9, true)  // 同步腿
+	seedVisibilityChannel(t, db, 2, 0, false) // 正常异步渠道
+	seedVisibilityChannel(t, db, 9, 0, true)  // 同步腿
 
 	abilities := []Ability{{ChannelId: 2}, {ChannelId: 9}}
 	for _, path := range []string{"/v1/videos", ""} {
-		got := filterAbilitiesByRequestPathAndModel(abilities, path, "gpt-image-2")
+		got := filterAbilitiesByConstraints(abilities, "gpt-image-2", pathFilters(path))
 		ids := make([]int, 0, len(got))
 		for _, a := range got {
 			ids = append(ids, a.ChannelId)
@@ -103,10 +119,10 @@ func TestFilterAbilities_ExcludesSyncRelayChannels(t *testing.T) {
 // 没有这条的话，「把所有渠道都过滤掉」也能让上面那条通过。
 func TestFilterAbilities_KeepsNormalChannels(t *testing.T) {
 	db := setupVisibilityTestDB(t)
-	seedVisibilityChannel(t, db, 2, false)
-	seedVisibilityChannel(t, db, 3, false)
+	seedVisibilityChannel(t, db, 2, 0, false)
+	seedVisibilityChannel(t, db, 3, 0, false)
 
-	got := filterAbilitiesByRequestPathAndModel([]Ability{{ChannelId: 2}, {ChannelId: 3}}, "/v1/videos", "gpt-image-2")
+	got := filterAbilitiesByConstraints([]Ability{{ChannelId: 2}, {ChannelId: 3}}, "gpt-image-2", pathFilters("/v1/videos"))
 	assert.Len(t, got, 2, "普通渠道被误杀了 —— 那会让正常请求无渠道可用")
 }
 
@@ -114,12 +130,12 @@ func TestFilterAbilities_KeepsNormalChannels(t *testing.T) {
 func TestFilterChannels_ExcludesSyncRelayChannels(t *testing.T) {
 	db := setupVisibilityTestDB(t)
 	common.MemoryCacheEnabled = true
-	seedVisibilityChannel(t, db, 2, false)
-	seedVisibilityChannel(t, db, 9, true)
+	seedVisibilityChannel(t, db, 2, 0, false)
+	seedVisibilityChannel(t, db, 9, 0, true)
 	primeChannelCache(t, 2, 9)
 
 	for _, path := range []string{"/v1/videos", ""} {
-		got := filterChannelsByRequestPathAndModel([]int{2, 9}, path, "gpt-image-2")
+		got, _ := filterCandidateIDs([]int{2, 9}, "gpt-image-2", pathFilters(path))
 		assert.Equal(t, []int{2}, got,
 			"requestPath=%q 时同步腿仍然进了正常路由（内存缓存路径）", path)
 	}
@@ -128,11 +144,12 @@ func TestFilterChannels_ExcludesSyncRelayChannels(t *testing.T) {
 func TestFilterChannels_KeepsNormalChannels(t *testing.T) {
 	db := setupVisibilityTestDB(t)
 	common.MemoryCacheEnabled = true
-	seedVisibilityChannel(t, db, 2, false)
-	seedVisibilityChannel(t, db, 3, false)
+	seedVisibilityChannel(t, db, 2, 0, false)
+	seedVisibilityChannel(t, db, 3, 0, false)
 	primeChannelCache(t, 2, 3)
 
-	assert.Equal(t, []int{2, 3}, filterChannelsByRequestPathAndModel([]int{2, 3}, "/v1/videos", "gpt-image-2"))
+	got, _ := filterCandidateIDs([]int{2, 3}, "gpt-image-2", pathFilters("/v1/videos"))
+	assert.Equal(t, []int{2, 3}, got)
 }
 
 // ⭐⭐ 钉住「两条路都得有」这件事本身。
@@ -142,14 +159,14 @@ func TestFilterChannels_KeepsNormalChannels(t *testing.T) {
 func TestBothChannelSelectionPathsAgreeOnSyncRelay(t *testing.T) {
 	db := setupVisibilityTestDB(t)
 	common.MemoryCacheEnabled = true
-	seedVisibilityChannel(t, db, 2, false)
-	seedVisibilityChannel(t, db, 9, true)
+	seedVisibilityChannel(t, db, 2, 0, false)
+	seedVisibilityChannel(t, db, 9, 0, true)
 	primeChannelCache(t, 2, 9)
 
-	viaCache := filterChannelsByRequestPathAndModel([]int{2, 9}, "/v1/videos", "gpt-image-2")
+	viaCache, _ := filterCandidateIDs([]int{2, 9}, "gpt-image-2", pathFilters("/v1/videos"))
 
 	viaDB := make([]int, 0, 2)
-	for _, a := range filterAbilitiesByRequestPathAndModel([]Ability{{ChannelId: 2}, {ChannelId: 9}}, "/v1/videos", "gpt-image-2") {
+	for _, a := range filterAbilitiesByConstraints([]Ability{{ChannelId: 2}, {ChannelId: 9}}, "gpt-image-2", pathFilters("/v1/videos")) {
 		viaDB = append(viaDB, a.ChannelId)
 	}
 
@@ -159,87 +176,52 @@ func TestBothChannelSelectionPathsAgreeOnSyncRelay(t *testing.T) {
 	assert.Equal(t, []int{2}, viaCache, "两条都该只剩正常渠道")
 }
 
-// ⭐⭐⭐ 这条钉的是「过滤放错位置」——它比"没过滤"更危险，因为后果是【全站故障】。
+// ⭐⭐⭐ 「过滤放错位置」比"没过滤"更危险 —— 后果是【全站故障】。
 //
-// 2026-08-25 在真库上实测撞到:
-//
-//	同步腿 priority=999、正常渠道 priority=10 →
-//	优先级档位在 SQL 里用 MAX(priority) 算, 同步腿独占最高档 →
-//	之后再把它过滤掉, 那一档空了 → "无可用渠道" →
-//	**优先级更低的正常渠道根本轮不到**。正常客户请求直接全废。
-//
-// 所以排除必须发生在【算档位之前】(SQL 层), 不能查出来再过滤。
-// 这条测试专门盯这个位置: 同步腿优先级设得比正常渠道【高】。
+// 2026-08-25 在真库上实测撞到: 同步腿 priority=999、正常渠道 priority=10 →
+// 同步腿独占最高档 → 过滤后那一档空了 → "无可用渠道" → 正常客户请求全废。
+// 这里端到端走生产那条 DB 路径(GetRandomSatisfiedChannel → GetChannel), 同步腿优先级故意设得最高。
 func TestSyncRelayWithHigherPriorityDoesNotBlockNormalChannels(t *testing.T) {
 	db := setupVisibilityTestDB(t)
+	seedVisibilityChannel(t, db, 2, 10, false)
+	seedVisibilityChannel(t, db, 9, 999, true)
 
-	p10, p999, w := int64(10), int64(999), uint(100)
-	require.NoError(t, db.Create(&Channel{
-		Id: 2, Type: 1, Key: "k2", Status: common.ChannelStatusEnabled, Name: "normal",
-		Weight: &w, Models: "gpt-image-2", Group: "default", Priority: &p10,
-	}).Error)
-	sync := &Channel{
-		Id: 9, Type: 1, Key: "k9", Status: common.ChannelStatusEnabled, Name: "sync",
-		Weight: &w, Models: "gpt-image-2", Group: "default", Priority: &p999,
+	for i := 0; i < 20; i++ { // 随机选渠道, 多抽几次
+		ch, err := GetRandomSatisfiedChannel("default", "gpt-image-2", 0, pathFilters("/v1/videos"))
+		require.NoError(t, err)
+		require.NotNil(t, ch,
+			"最高档被同步腿独占并清空了 —— 正常渠道轮不到, 这是【全站故障】不是隔离生效")
+		assert.Equal(t, 2, ch.Id, "同步腿不该出现在正常路由的候选里")
 	}
-	sync.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
-	require.NoError(t, db.Create(sync).Error)
-	require.NoError(t, db.Create(&Ability{Group: "default", Model: "gpt-image-2", ChannelId: 2, Enabled: true, Priority: &p10, Weight: 100}).Error)
-	require.NoError(t, db.Create(&Ability{Group: "default", Model: "gpt-image-2", ChannelId: 9, Enabled: true, Priority: &p999, Weight: 100}).Error)
-
-	// 档位表里不许出现同步腿那一档 —— 出现了就会浪费一次重试在空档上。
-	ids := syncRelayChannelIDs()
-	assert.Equal(t, []int{9}, ids, "同步腿必须被识别出来")
-
-	q, err := getChannelQuery("default", "gpt-image-2", 0)
-	require.NoError(t, err)
-	var abilities []Ability
-	require.NoError(t, q.Find(&abilities).Error)
-	require.NotEmpty(t, abilities,
-		"最高档被同步腿独占并清空了 —— 正常渠道轮不到, 这是【全站故障】不是隔离生效")
-	for _, a := range abilities {
-		assert.NotEqual(t, 9, a.ChannelId, "同步腿不该出现在正常路由的候选里")
-	}
-	assert.Equal(t, 2, abilities[0].ChannelId, "第一档应该直接就是那个正常渠道")
 }
 
 // 同步腿不许占掉一个「优先级档位」——占了会白白吃掉一次重试机会。
 //
-// ⚠ 这条要【三个】渠道才测得出来。两个的时候两种实现给的答案一样:
+// ⚠ 这条要【三个】渠道才测得出来:
 //
-//	  排除了:  档位=[10]        retry=1 → 超出范围, 取最小 = 10
-//	  没排除:  档位=[999,10]    retry=1 → 10
-//	一样。所以第一版(只有两个渠道)让「getPriority 不排除」这个变异活了下来。
-//	三个渠道才分得开:
-//	  排除了:  档位=[100,10]     retry=1 → 10   ← 第二次重试就用上最后一条腿
-//	  没排除:  档位=[999,100,10] retry=1 → 100  ← 一次重试白白花在空档上
+//	排除了:  档位=[100,10]     retry=1 → 10   ← 第二次重试就用上最后一条腿
+//	没排除:  档位=[999,100,10] retry=1 → 100  ← 一次重试白白花在空档上
 func TestSyncRelayDoesNotConsumeAPriorityTier(t *testing.T) {
 	db := setupVisibilityTestDB(t)
+	seedVisibilityChannel(t, db, 9, 999, true) // 同步腿，优先级最高
+	seedVisibilityChannel(t, db, 2, 100, false)
+	seedVisibilityChannel(t, db, 3, 10, false)
 
-	mk := func(id int, prio int64, sync bool) {
-		w := uint(100)
-		p := prio
-		ch := &Channel{
-			Id: id, Type: 1, Key: fmt.Sprintf("k%d", id), Status: common.ChannelStatusEnabled,
-			Name: fmt.Sprintf("ch%d", id), Weight: &w, Models: "gpt-image-2",
-			Group: "default", Priority: &p,
-		}
-		if sync {
-			ch.SetSetting(dto.ChannelSettings{QuriovSyncImageRelay: true})
-		}
-		require.NoError(t, db.Create(ch).Error)
-		require.NoError(t, db.Create(&Ability{
-			Group: "default", Model: "gpt-image-2", ChannelId: id,
-			Enabled: true, Priority: &p, Weight: 100,
-		}).Error)
-	}
-	mk(9, 999, true)  // 同步腿，优先级最高
-	mk(2, 100, false) // 正常渠道 A
-	mk(3, 10, false)  // 正常渠道 B
-
-	got, err := getPriority("default", "gpt-image-2", 1)
+	ch, err := GetRandomSatisfiedChannel("default", "gpt-image-2", 1, pathFilters("/v1/videos"))
 	require.NoError(t, err)
-	assert.Equal(t, 10, got,
-		"第一次重试应该直接落到最后一条正常腿(优先级 10)。拿到 100 说明同步腿占了一档, "+
+	require.NotNil(t, ch)
+	assert.Equal(t, 3, ch.Id,
+		"第一次重试应该直接落到最后一条正常腿(优先级 10)。拿到 #2 说明同步腿占了一档, "+
 			"一次重试机会被白白花在一个会被过滤空的档位上")
+}
+
+// 重投那条路要能把同步腿【单独】挑出来 —— 它对正常路由不可见, 但不能对重投也不可见。
+func TestGetSyncRelayChannels_DBPathFindsOnlySyncLegs(t *testing.T) {
+	db := setupVisibilityTestDB(t)
+	seedVisibilityChannel(t, db, 2, 10, false)
+	seedVisibilityChannel(t, db, 9, 0, true)
+
+	got := GetSyncRelayChannels("default", "gpt-image-2")
+	require.Len(t, got, 1, "同步腿没被挑出来 —— 重投将无腿可换（而且是静默的）")
+	assert.Equal(t, 9, got[0].Id)
 }

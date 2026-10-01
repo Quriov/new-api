@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 )
@@ -31,7 +32,17 @@ import (
 // ResubmitTaskFunc 由 main 包注入，执行真正的「拿原始请求打新渠道」。
 // 走注入而不是直接调用，是为了不破坏 service -> relay 的依赖方向
 // （跟隔壁 GetTaskAdaptorFunc 同一个套路）。
-var ResubmitTaskFunc func(ctx context.Context, task *model.Task, ch *model.Channel) (upstreamTaskID string, taskData []byte, platform constant.TaskPlatform, err error)
+var ResubmitTaskFunc func(ctx context.Context, task *model.Task, ch *model.Channel) (*ResubmitSubmission, error)
+
+// ResubmitSubmission 是异步重投打到新渠道后拿回来的东西。
+// PluginState 是上游 rc.27 起任务插件自己的跨轮状态，换了腿必须跟着换，
+// 否则下一轮轮询会拿旧渠道插件的状态去查新渠道的任务。
+type ResubmitSubmission struct {
+	UpstreamTaskID string
+	TaskData       []byte
+	PluginState    []byte
+	Platform       constant.TaskPlatform
+}
 
 // SyncImageRelayFunc 由 main 包注入，对【只有同步接口】的上游直接出图。
 // 同样走注入，理由跟上面一样：不破坏 service -> relay 的依赖方向。
@@ -122,9 +133,14 @@ func PickResubmitChannel(group, modelName, requestPath string, tried []int) (*mo
 	// 上限用一个够大的常数：函数内部会把超出的 retry 夹到最后一档，
 	// 所以扫到重复即可停。
 	const maxPriorityTiers = 16
+	// 上游 rc.31 起渠道选择改成「过滤器」形式。这里只带请求路径过滤（跟首次提交同一条规则，
+	// 管的是高级自定义渠道按路径开放）。不带任务插件身份过滤：新渠道能不能接这个任务，
+	// 由重投执行端按新渠道类型解析插件时判定 —— 解析不到就明确报错、记进「试过」，
+	// 任务照原来的失败流程走，不会误收钱。
+	filters := []dto.ChannelFilter{{Kind: dto.FilterRequestPath, RequestPath: requestPath}}
 	var lastPicked int
 	for tier := 0; tier < maxPriorityTiers; tier++ {
-		ch, err := model.GetRandomSatisfiedChannel(group, modelName, tier, requestPath)
+		ch, err := model.GetRandomSatisfiedChannel(group, modelName, tier, filters)
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +214,10 @@ func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, fail
 		return ResubmitNone
 	}
 
-	upstreamTaskID, taskData, platform, err := ResubmitTaskFunc(ctx, task, ch)
+	submission, err := ResubmitTaskFunc(ctx, task, ch)
+	if err == nil && (submission == nil || submission.UpstreamTaskID == "") {
+		err = fmt.Errorf("重投器没有返回上游任务 ID")
+	}
 	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("任务 %s 重投到渠道 #%d(%s) 失败：%s",
 			task.TaskID, ch.Id, ch.Name, err.Error()))
@@ -208,19 +227,23 @@ func TryResubmitTaskOnAnotherChannel(ctx context.Context, task *model.Task, fail
 		return ResubmitNone
 	}
 
+	upstreamTaskID := submission.UpstreamTaskID
 	fromChannel := task.ChannelId
 	task.MarkChannelTried(ch.Id)
 	task.ChannelId = ch.Id
 	task.PrivateData.UpstreamTaskID = upstreamTaskID
 	task.PrivateData.ResubmitCount++
 	task.PrivateData.Key = "" // 换渠道了，旧渠道的 key 不能再带着
-	if platform != "" && platform != task.Platform {
+	// 换了腿，旧腿的插件状态和连续轮询失败计数都不再适用。
+	task.PrivateData.PluginState = submission.PluginState
+	task.PrivateData.PollFailures = 0
+	if submission.Platform != "" && submission.Platform != task.Platform {
 		// 新渠道的类型可能跟老的不一样。轮询是按 platform 分组挑适配器的，
 		// 这里不跟着改，下一轮就会拿错适配器去查这个任务。
-		task.Platform = platform
+		task.Platform = submission.Platform
 	}
-	if len(taskData) > 0 {
-		task.Data = taskData
+	if len(submission.TaskData) > 0 {
+		task.Data = submission.TaskData
 	}
 	// 回到「在跑」状态，让下一轮轮询继续跟它。
 	task.Status = model.TaskStatusInProgress

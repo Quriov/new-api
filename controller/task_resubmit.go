@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -13,23 +14,24 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
 
 // ResubmitTaskOnChannel 是「任务失败换渠道重投」的执行端。
 //
-// 轮询跑在后台协程里，手上没有 gin.Context，而整条提交链路（适配器、模型映射、
-// 渠道 meta）都是围绕 gin.Context 写的。所以这里用留存的原始请求体造一个
+// 轮询跑在后台协程里，手上没有 gin.Context，而整条提交链路（插件适配器、模型映射、
+// 渠道 meta、参数覆盖）都是围绕 gin.Context 写的。所以这里用留存的原始请求体造一个
 // 等价的上下文出来，走跟真实请求完全相同的那条路——而不是另写一套发请求的代码。
 // 另写一套的代价是它会跟真实路径慢慢分叉，而分叉的地方只有出事那天才会被发现。
-func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Channel) (*service.ResubmitSubmission, error) {
 	if task == nil || ch == nil {
-		return "", nil, "", fmt.Errorf("任务或渠道为空")
+		return nil, fmt.Errorf("任务或渠道为空")
 	}
 	body, ok := task.ResubmitPayload()
 	if !ok {
-		return "", nil, "", fmt.Errorf("没有留存原始请求，无法重投")
+		return nil, fmt.Errorf("没有留存原始请求，无法重投")
 	}
 
 	modelName := task.Properties.OriginModelName
@@ -37,20 +39,21 @@ func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Chan
 		modelName = task.Properties.UpstreamModelName
 	}
 	if modelName == "" {
-		return "", nil, "", fmt.Errorf("任务上没有记录模型名，无法重投")
+		return nil, fmt.Errorf("任务上没有记录模型名，无法重投")
 	}
 
 	path := task.PrivateData.ResubmitPath
 	if path == "" {
-		return "", nil, "", fmt.Errorf("任务上没有记录请求路径，无法重投")
+		return nil, fmt.Errorf("任务上没有记录请求路径，无法重投")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
 	if err != nil {
-		return "", nil, "", fmt.Errorf("构造重投请求失败: %w", err)
+		return nil, fmt.Errorf("构造重投请求失败: %w", err)
 	}
-	if ct := task.PrivateData.ResubmitContentType; ct != "" {
-		req.Header.Set("Content-Type", ct)
+	contentType := task.PrivateData.ResubmitContentType
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	req.ContentLength = int64(len(body))
 
@@ -65,15 +68,28 @@ func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Chan
 	common.SetContextKey(c, constant.ContextKeyTokenId, task.PrivateData.TokenId)
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, modelName)
 
+	// JSON 请求体原样交给插件（跟 /v1/videos 首次提交时 openai_video 协议解码器的做法一致：
+	// 整个对象透传、只把 model 换成客户填的型号名）。不这么做的话，插件会退回到
+	// ValidateBasicTaskRequest 的固定结构体，客户传的 aspect_ratio / image_size / images
+	// 这类字段会在重投时被悄悄丢掉 —— 换了腿、出的却是另一张图。
+	if strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+		var requestBody map[string]any
+		if err := common.Unmarshal(body, &requestBody); err != nil {
+			return nil, fmt.Errorf("留存的请求体不是合法 JSON: %w", err)
+		}
+		requestBody["model"] = modelName
+		c.Set("task_request", requestBody)
+	}
+
 	// 渠道 meta 走跟真实请求一模一样的那个函数，避免两边对「渠道怎么装进上下文」
-	// 的理解产生分叉。它同时会设置 channel_type，下游据此选适配器。
+	// 的理解产生分叉。它同时会设置 channel_type、参数覆盖、模型映射，下游据此选插件。
 	if setupErr := middleware.SetupContextForSelectedChannel(c, ch, modelName); setupErr != nil {
-		return "", nil, "", fmt.Errorf("装载渠道 #%d 失败: %s", ch.Id, setupErr.Error())
+		return nil, fmt.Errorf("装载渠道 #%d 失败: %s", ch.Id, setupErr.Error())
 	}
 
 	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
-		return "", nil, "", fmt.Errorf("构造 relay info 失败: %w", err)
+		return nil, fmt.Errorf("构造 relay info 失败: %w", err)
 	}
 	info.Action = task.Action
 	info.OriginModelName = modelName
@@ -86,11 +102,16 @@ func ResubmitTaskOnChannel(ctx context.Context, task *model.Task, ch *model.Chan
 		info.PublicTaskID = task.TaskID
 	}
 
-	upstreamTaskID, taskData, err := relay.ResubmitTaskToChannel(c, info)
+	result, err := relay.ResubmitTaskToChannel(c, info)
 	if err != nil {
-		return "", nil, "", err
+		return nil, err
 	}
-	return upstreamTaskID, taskData, relay.GetTaskPlatform(c), nil
+	return &service.ResubmitSubmission{
+		UpstreamTaskID: result.UpstreamTaskID,
+		TaskData:       result.TaskData,
+		PluginState:    result.PluginState,
+		Platform:       result.Platform,
+	}, nil
 }
 
 // nullWriter 满足 gin.CreateTestContext 对 http.ResponseWriter 的要求。

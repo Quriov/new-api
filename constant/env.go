@@ -18,6 +18,11 @@ var GenerateDefaultToken bool
 var ErrorLogEnabled bool
 var TaskQueryLimit int
 var TaskTimeoutMinutes int
+var TaskPollMaxFailures = 20
+var TaskPluginProtocolTimeoutSeconds int
+var TaskPluginProtocolTickMilliseconds int
+var TaskPluginProtocolTickJitterMilliseconds int
+var TaskPluginProtocolHeartbeatSeconds int
 
 // ── 任务失败后换渠道重投（Quriov 改造）────────────────────────────────
 // 上游把任务【收下了】之后才失败的那一类，new-api 原本完全没有兜底：

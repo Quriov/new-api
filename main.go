@@ -23,7 +23,9 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relay"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/router"
@@ -46,6 +48,9 @@ var buildFS embed.FS
 var indexPage []byte
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "plugin" {
+		os.Exit(jsplugin.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	startTime := time.Now()
 	kitutil.SetLogging(common.SysLog, func(message string) {
 		logger.LogError(nil, message)
@@ -73,7 +78,6 @@ func main() {
 	} else {
 		common.SysLog("quriov: 任务失败换渠道重投 已【关闭】 (TASK_RESUBMIT_ENABLED=false) — 上游收下任务后才失败的那一类将没有任何兜底")
 	}
-
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -115,6 +119,7 @@ func main() {
 
 		go model.SyncChannelCache(common.SyncFrequency)
 	}
+	wsmanager.StartSubscriber(context.Background())
 
 	// Warm pricing after channel cache initialization so Advanced Custom
 	// endpoint inference can read cached route settings on first request.
@@ -122,6 +127,7 @@ func main() {
 
 	// 热更新配置
 	go model.SyncOptions(common.SyncFrequency)
+	go controller.SyncTaskPlugins()
 
 	// 周期性重载授权策略，保证多节点/多 master 部署下权限变更能传播到每个实例
 	go authz.StartPolicySync(common.SyncFrequency)
@@ -160,6 +166,7 @@ func main() {
 
 	// Wire task resubmit executor (Quriov 改造: 任务失败后换渠道重投).
 	// 同样是为了不破坏 service -> relay/controller 的依赖方向。
+	// ⚠ 必须在 system task runner 启动之前接好, 理由同上。
 	service.ResubmitTaskFunc = controller.ResubmitTaskOnChannel
 	service.SyncImageRelayFunc = controller.SyncImageRelayOnChannel
 
@@ -332,6 +339,12 @@ func InitResources() error {
 	if err = authz.Init(model.DB); err != nil {
 		common.FatalLog("failed to initialize authorization: " + err.Error())
 		return err
+	}
+	if common.PasswordLoginEncryptionEnabled {
+		if err = model.InitPasswordEncryption(); err != nil {
+			common.FatalLog("failed to initialize password encryption: " + err.Error())
+			return err
+		}
 	}
 
 	model.CheckSetup()

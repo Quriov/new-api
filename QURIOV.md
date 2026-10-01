@@ -1,7 +1,10 @@
 # QURIOV.md — 这个 fork 相对上游改了什么
 
 > 本仓是 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的**冻结改造分支**。
-> 冻结点：`2d8e50bf36e9`（上游 2026-08-21 15:47 UTC 的最新提交）。
+> 冻结点：上游 release **`v1.0.0-rc.40`**（2026-09-21，`0aec08fee`）。
+> 上一个冻结点是 `2d8e50bf36e9`（rc.25 之后一个提交，2026-08-21）；2026-09-29 升到 rc.40，
+> 改造 1–3 按最终行为逐处移植（不是逐 commit cherry-pick，理由见文末「2026-09-29 升级 rc.40」），
+> 并新增改造 4（rc.40 在我们的型号上的三处回归垫片）。
 >
 > - `main` = **纯上游镜像**，不放任何自己的东西，保证随时能干净 fast-forward 同步。
 > - `quriov` = **我们的改造线**，默认分支。上游更新了就去看看有没有值得摘的，而不是自动跟。
@@ -150,7 +153,8 @@ ORDER BY created_at DESC LIMIT 20;
 所以只拖同渠道排在后面的任务；且系统任务的租约靠后台心跳续，**这一轮没有固定超时**。
 
 **碰了哪些文件**：`relaykit/dto/channel_settings.go`（开关）·
-`model/channel_cache.go`（正常路由隐藏 + 专用查询）· `relay/quriov_sync_image_relay.go`（协议转换）·
+`model/channel_constraint.go`（正常路由隐藏，DB / 内存缓存两条路共用）· `model/channel_cache.go`（专用查询）·
+`relay/quriov_sync_image_relay.go`（协议转换）·
 `service/task_resubmit.go`（三态 + 同步腿分支）· `service/task_polling.go`（结算而非退款）·
 `controller/task_resubmit.go` + `main.go`（接线）
 
@@ -183,8 +187,10 @@ ORDER BY created_at DESC LIMIT 20;
 补参数本该靠渠道的**参数覆盖**（`param_override`）—— 但上游 new-api 只在同步接口上执行它，
 **异步任务（`/v1/videos`）这条路上它是摆设**，配了也不生效。
 
-**做了什么**：`relay/channel/task/sora/adaptor.go` 的 JSON 请求体分支，在换完型号名之后
-调用上游现成的 `ApplyParamOverrideWithRelayInfo`。没有新造任何配置格式，用的就是后台渠道编辑页里
+**做了什么**：`relay/channel/task/jsplugin/adaptor.go` 的 `BuildRequestBody` JSON 分支（任务插件造好最终请求体、
+model 已换成上游名之后）调用上游现成的 `ApplyParamOverrideWithRelayInfo`。
+（rc.25 时挂在 Go 的 sora 适配器上；上游 rc.27 把任务适配器换成 JS 插件、删了那个文件，rc.40 起挂在通用插件适配器上，
+对所有任务插件一致 —— 条件都按 `original_model` 写，碰不到别的型号。）没有新造任何配置格式，用的就是后台渠道编辑页里
 那个「参数覆盖」框。首次提交、渠道重试、改造 1 的换渠道重投都经过这个函数，所以三条路一致。
 
 **刻意不做的**：
@@ -209,5 +215,61 @@ ORDER BY created_at DESC LIMIT 20;
 `original_model` 不在请求体里，条件判断会回落到上游提供的上下文（`BuildParamOverrideContext`），
 取到的是客户填的型号名；`keep_origin` 保住客户自己传的 `image_size`。
 
-**测试**：`relay/channel/task/sora/adaptor_param_override_test.go`（5 条）：按档补参数、
+**测试**：`relay/channel/task/jsplugin/quriov_param_override_test.go`（5 条，用**内置 sora 插件**跑，跟生产同一段 JS）：按档补参数、
 尊重客户自带档位、不碰同渠道其它型号、无配置时行为不变、`return_error` 在出门前就失败。
+
+### 4. rc.40 在我们的型号上的三处回归垫片（2026-09-29，升级 rc.40 时）
+
+**怎么发现的**：同一个演练脚本（`scripts/quriov-e2e/`，mock 上游 + 真 HTTP + 生产同款渠道配置）分别打旧镜像和 rc.40：
+旧镜像全过，rc.40 原样有三处失败，**单测一条都没抓到** —— 它们只在「真路由 → 插件 → 真计价」里出现。
+
+| 回归 | 客户看到的 | 根因 | 垫片（`relay/channel/task/jsplugin/quriov_compat.go` + `relay/relay_task.go`） |
+|---|---|---|---|
+| 字段被丢 | 要 16:9 拿到默认比例；分档型号补错尺寸、该拒的比例不拒 | `/v1/videos` 上我们卖的型号不在 sora 插件的认领表里 ⇒ 走旧式路由，请求体被压成固定结构体 `TaskSubmitReq`，`aspect_ratio` / `image_size` 等被丢 | sora 插件 + 旧式路由 + JSON ⇒ 原样透传（跟插件自己的 `openai_video` 解码器同语义） |
+| 图片尺寸被拒 | 传 `size=1024x1024` 直接 400 `plugin_usage_invalid` | sora 插件用量 schema 的 `size` 只认 4 个视频尺寸 | `TASK_PRICE_PATCH` 里的型号不拿插件用量 schema 校验、不做用量估算 |
+| 扣 0 元 | 映射到带内置 token 表达式的上游型号时，每单扣 0 | 上游 rc.37 内置了若干图片型号的 token 计费表达式，并顺着**映射后的上游名**去找；任务接口没有 token 用量 | `TASK_PRICE_PATCH` 里的型号一律走 `ModelPrice`，不启用计费表达式、不随上游回报调价 |
+
+**判据收得很窄**：透传只对 sora 插件的旧式路由；放行校验 / 固定价只对 `TASK_PRICE_PATCH` 列名的型号 ——
+没列名的真 sora-2 照旧受上游校验（有反向测试）。**`TASK_PRICE_PATCH` 的含义因此比以前更强**：
+列名 = 这个型号按次收 `ModelPrice`，插件的用量 schema、内置表达式一概不管它。上新型号时漏列，
+在 rc.40 上的后果不只是「按秒乘价」，还可能被插件校验拒单或被内置表达式按 0 收。
+
+**测试**：`quriov_compat_test.go`（5 条，变异：去掉任一垫片对应测试变红）+ 演练脚本里的计价断言。
+
+---
+
+## 演练脚本与 CI（2026-09-29）
+
+`scripts/quriov-e2e/e2e.py` + `mock_upstream.py`：对跑着的 new-api 打真实 HTTP，核对改造 1–4 的行为（参数覆盖、
+字段透传、按次计价、`return_error` 拒单不扣费、换渠道重投只收一次钱、同步腿不进正常路由）。只连本机 mock，
+型号名和价格全是占位。
+
+`quriov-build-check.yml` 在 PR / push 上跑：
+
+1. 新镜像 + MySQL 8.4（跟生产同一个大版本）跑演练 `--phase full`；
+2. **换镜像演练**：当前生产镜像建库、造数据 → 新镜像接管同一个库跑 `--phase smoke` → 再换回旧镜像跑 `--phase smoke`，
+   每一步导表结构，把「自动迁移改了什么」「换回旧镜像后旧镜像又改了什么」写进 job summary。
+   这就是上线 / 只换镜像回滚那两个动作的彩排。**升级上线后要把里面的 `OLD_IMAGE` 改成新的生产 tag。**
+
+本地跑（不用 docker，SQLite）：
+
+```bash
+python3 scripts/quriov-e2e/mock_upstream.py 18090 &
+go build -o /tmp/new-api . && python3 scripts/quriov-e2e/e2e.py --phase full --bin /tmp/new-api --mock-port 18090 --state /tmp/e2e-state.json
+```
+
+---
+
+## 2026-09-29 升级 rc.40：为什么是「逐处移植」而不是 cherry-pick
+
+rc.25 → rc.40 之间上游有 204 个提交，其中三处正好重写了我们改过的地方：rc.27 把 Go 任务适配器换成 JS 插件
+（删了 `relay/channel/task/sora/adaptor.go`）、rc.31 把渠道选择改成「过滤器」、rc.39 把终态收尾统一成
+`finalizeTerminalTask`。逐 commit cherry-pick 的话 12 个里几乎每个都冲突在已被重写的代码上，
+所以按 quriov 分支的**最终行为**逐处移植，每处取舍写在对应 commit 里。附带的变化：
+
+- 改造 2 的「同步腿不许占优先级档位 / 不许独占最高档」：rc.31 起 DB 路径是「查全量 → Go 里过滤 → 过滤后算档位」，
+  08-25 那个全站故障在结构上已不可能；`ability.go` 的 SQL 层排除不再需要，排除改挂在两条路径共用的过滤函数上。
+  对应的两条测试保留，并改成端到端走 `GetRandomSatisfiedChannel`（sqlite 上也能跑了）。
+- 改造 1 的重投执行端按 rc.40 的 `RelayTaskSubmit` 新顺序重写（先按新渠道类型解析插件、先映射再校验、任何 2xx 算成功），
+  JSON 请求体原样作为 `task_request` 交给插件；换腿时同步替换插件状态 `PluginState`、清零 `PollFailures`。
+

@@ -27,14 +27,14 @@ import (
 type failingPollAdaptor struct{ reason string }
 
 func (a *failingPollAdaptor) Init(*relaycommon.RelayInfo) {}
-func (a *failingPollAdaptor) FetchTask(string, string, map[string]any, string) (*http.Response, error) {
+func (a *failingPollAdaptor) FetchTask(string, string, *model.Task, string) (*http.Response, error) {
 	// 故意不用 new-api 自己的响应格式，好让轮询走 adaptor.ParseTaskResult 那条路。
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(bytes.NewReader([]byte(`{"upstream":"whatever"}`))),
 	}, nil
 }
-func (a *failingPollAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+func (a *failingPollAdaptor) ParseTaskResult(*model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error) {
 	return &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: a.reason}, nil
 }
 func (a *failingPollAdaptor) AdjustBillingOnComplete(*model.Task, *relaycommon.TaskInfo) int {
@@ -90,7 +90,7 @@ func setupResubmitPollingTest(t *testing.T, failReason string) (*failingPollAdap
 	task := &model.Task{
 		TaskID: "task_poll_0001", Platform: constant.TaskPlatform("1"),
 		UserId: 9, Group: testResubmitGroup, ChannelId: 2,
-		Action: constant.TaskActionTextGenerate, Quota: 1000,
+		Action: constant.TaskActionTextToVideo, Quota: 1000,
 		Status: model.TaskStatus(model.TaskStatusInProgress), Progress: "30%",
 		CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(),
 	}
@@ -115,9 +115,9 @@ func TestPolling_UpstreamFailureIsResubmittedOnAnotherChannel(t *testing.T) {
 	adaptor, ch, task := setupResubmitPollingTest(t, prodReasonUpstreamGlitch)
 
 	var gotChannel int
-	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, c *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(_ context.Context, _ *model.Task, c *model.Channel) (*ResubmitSubmission, error) {
 		gotChannel = c.Id
-		return "upstream-new", []byte(`{"id":"upstream-new"}`), constant.TaskPlatform("1"), nil
+		return &ResubmitSubmission{UpstreamTaskID: "upstream-new", TaskData: []byte(`{"id":"upstream-new"}`), Platform: constant.TaskPlatform("1")}, nil
 	}
 
 	err := updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(),
@@ -145,9 +145,9 @@ func TestPolling_ContentPolicyFailureStillGoesTerminalAndRefunds(t *testing.T) {
 	adaptor, ch, task := setupResubmitPollingTest(t, prodReasonContentReject)
 
 	called := false
-	ResubmitTaskFunc = func(context.Context, *model.Task, *model.Channel) (string, []byte, constant.TaskPlatform, error) {
+	ResubmitTaskFunc = func(context.Context, *model.Task, *model.Channel) (*ResubmitSubmission, error) {
 		called = true
-		return "should-not-happen", nil, "", nil
+		return &ResubmitSubmission{UpstreamTaskID: "should-not-happen"}, nil
 	}
 
 	err := updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(),
