@@ -113,7 +113,7 @@ func Distribute() func(c *gin.Context) {
 				}
 				message := selectErr.Message
 				if selectErr.NoAvailableChannel {
-					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
+					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model, selectErr.Channel == nil)
 				} else if selectErr.MessageID != "" {
 					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
 				}
@@ -133,7 +133,11 @@ func Distribute() func(c *gin.Context) {
 // noAvailableChannelMessage explains a 503 for a task-plugin-claimed model.
 // The response tells the caller the model is plugin-claimed without naming the
 // plugin; the candidate plugin keys go to the server log under the request id.
-func noAvailableChannelMessage(c *gin.Context, group, modelName string) string {
+// When modelMayBeUnknown is set (no channel matched the name at all) and no
+// channel of the group declares the name, the message says the model does not
+// exist and suggests similarly spelled models the caller can use, so a typo is
+// not mistaken for an outage. The wrong name is never routed to a suggestion.
+func noAvailableChannelMessage(c *gin.Context, group, modelName string, modelMayBeUnknown bool) string {
 	value, exists := c.Get(jsplugin.ContextKeyPinnedPlugin)
 	pinned, ok := value.(jsplugin.PinnedPlugin)
 	if exists && ok && pinned.Plugin != nil {
@@ -150,6 +154,19 @@ func noAvailableChannelMessage(c *gin.Context, group, modelName string) string {
 		}
 		logger.LogWarn(c, "task_plugin subsystem=distribution event=no_available_channel group=%q model=%q plugins=%q reason=no_eligible_channel", group, modelName, strings.Join(keys, ","))
 		return i18n.T(c, i18n.MsgDistributorNoAvailableChannelTaskPlugin, map[string]any{"Group": group, "Model": modelName})
+	}
+	if modelMayBeUnknown {
+		var allowed func(string) bool
+		if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+			limit, _ := common.GetContextKeyType[map[string]bool](c, constant.ContextKeyTokenModelLimit)
+			allowed = func(name string) bool { return TokenModelLimitAllows(limit, name) }
+		}
+		if unknown, suggestions := service.DiagnoseUnknownModel(c, group, modelName, allowed); unknown {
+			if len(suggestions) > 0 {
+				return i18n.T(c, i18n.MsgDistributorModelNotFoundSuggest, map[string]any{"Group": group, "Model": modelName, "Suggestions": strings.Join(suggestions, ", ")})
+			}
+			return i18n.T(c, i18n.MsgDistributorModelNotFound, map[string]any{"Group": group, "Model": modelName})
+		}
 	}
 	return i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": group, "Model": modelName})
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -262,9 +264,114 @@ func TestNoAvailableChannelMessageWithoutPlugin(t *testing.T) {
 	plain, _ := gin.CreateTestContext(nil)
 	plain.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	plain.Request.Header.Set("Accept-Language", "en")
-	generic := noAvailableChannelMessage(plain, "default", "gpt-4o")
+	generic := noAvailableChannelMessage(plain, "default", "gpt-4o", false)
 	assert.NotContains(t, generic, "task plugin")
 	assert.Contains(t, generic, "gpt-4o")
+}
+
+// A mistyped model name must not read like an outage: when no channel of the
+// group declares the name, the error says the model does not exist and names
+// the similarly spelled model the caller can use. A known model whose channels
+// are all disabled keeps the original "no available channel" wording.
+func TestDistributeExplainsUnknownModelName(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousDB, previousCache, previousMaster, previousPath := model.DB, common.MemoryCacheEnabled, common.IsMasterNode, common.SQLitePath
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	// InitDB also sets the dialect-specific column quoting the channel queries use.
+	t.Setenv("SQL_DSN", "")
+	t.Setenv("LOG_SQL_DSN", "")
+	common.IsMasterNode = false
+	common.SQLitePath = filepath.Join(t.TempDir(), "distributor.db")
+	require.NoError(t, model.InitDB())
+	database := model.DB
+	t.Cleanup(func() {
+		if sqlDB, err := database.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB, common.MemoryCacheEnabled, common.IsMasterNode, common.SQLitePath = previousDB, previousCache, previousMaster, previousPath
+		common.SetDatabaseTypes(previousType, previousLogType)
+	})
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	for _, seed := range []struct {
+		group, models string
+		status        int
+	}{
+		{"default", "gpt-image-2.5-2K,gpt-image-2", common.ChannelStatusEnabled},
+		{"default", "veo-3-fast", common.ChannelStatusAutoDisabled},
+		{"vip", "seedance-2.0", common.ChannelStatusEnabled},
+	} {
+		channel := &model.Channel{Name: seed.models, Key: "sk-" + seed.models, Status: seed.status, Group: seed.group, Models: seed.models}
+		require.NoError(t, model.DB.Create(channel).Error)
+		require.NoError(t, channel.AddAbilities(nil))
+	}
+
+	const suggestion = "Model gpt-image2.5-2k does not exist under group default. Did you mean gpt-image-2.5-2K? Model names must match exactly (distributor)"
+	for _, tc := range []struct {
+		name, path, model string
+		tokenLimit        map[string]bool
+		want              string
+		wantAbsent        []string
+	}{
+		{name: "typo suggests the real name", path: "/v1/chat/completions", model: "gpt-image2.5-2k", want: suggestion},
+		{name: "task endpoint shares the hint", path: "/v1/videos", model: "gpt-image2.5-2k", want: suggestion},
+		{name: "unrelated name gets no guess", path: "/v1/chat/completions", model: "totally-unrelated-name",
+			want: "Model totally-unrelated-name does not exist under group default; check the model name, GET /v1/models lists the models you can use (distributor)", wantAbsent: []string{"Did you mean", "gpt-image"}},
+		{name: "another group's model is not offered", path: "/v1/chat/completions", model: "seedance2.0",
+			want: "Model seedance2.0 does not exist under group default; check the model name, GET /v1/models lists the models you can use (distributor)", wantAbsent: []string{"seedance-2.0"}},
+		{name: "token-forbidden model is not offered", path: "/v1/chat/completions", model: "gpt-image2.5-2k", tokenLimit: map[string]bool{"gpt-image2.5-2k": true},
+			want: "Model gpt-image2.5-2k does not exist under group default; check the model name, GET /v1/models lists the models you can use (distributor)", wantAbsent: []string{"gpt-image-2.5-2K"}},
+		{name: "known model with disabled channels keeps original wording", path: "/v1/chat/completions", model: "veo-3-fast",
+			want: "No available channel for model veo-3-fast under group default (distributor)", wantAbsent: []string{"does not exist"}},
+	} {
+		for _, memoryCache := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/memory_cache=%v", tc.name, memoryCache), func(t *testing.T) {
+				common.MemoryCacheEnabled = memoryCache
+				router := gin.New()
+				router.POST(tc.path, RequestId(), func(c *gin.Context) {
+					common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+					if tc.tokenLimit != nil {
+						common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+						common.SetContextKey(c, constant.ContextKeyTokenModelLimit, tc.tokenLimit)
+					}
+				}, Distribute(), func(c *gin.Context) {
+					t.Error("requests without a channel must stop before the relay handler")
+				})
+				request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(fmt.Sprintf(`{"model":%q}`, tc.model)))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Accept-Language", "en")
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, request)
+
+				require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+				requestID := recorder.Header().Get(common.RequestIdKey)
+				require.NotEmpty(t, requestID)
+				assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":%q,"type":"new_api_error","code":"model_not_found"}}`,
+					tc.want+" (request id: "+requestID+")"), recorder.Body.String())
+				for _, absent := range tc.wantAbsent {
+					assert.NotContains(t, recorder.Body.String(), absent)
+				}
+			})
+		}
+	}
+}
+
+func TestSuggestModelNames(t *testing.T) {
+	candidates := []string{"gpt-image-2.5-2K", "gpt-image-2.5-4K", "gpt-image-2", "GPT_Image_2.5_2K", "gpt-5", "seedance-2.0"}
+	for _, tc := range []struct {
+		requested string
+		want      []string
+	}{
+		{"gpt-image2.5-2k", []string{"GPT_Image_2.5_2K", "gpt-image-2.5-2K"}},
+		{"GPT-IMAGE-2", []string{"gpt-image-2"}},
+		{"seedance 2.0", []string{"seedance-2.0"}},
+		{"gpt-image-2.5-3K", []string{"GPT_Image_2.5_2K", "gpt-image-2.5-2K", "gpt-image-2.5-4K"}},
+		{"seedanse-2.0", []string{"seedance-2.0"}},
+		{"gpt-4", nil},
+		{"kling-video-v3", nil},
+		{"", nil},
+	} {
+		assert.Equal(t, tc.want, service.SuggestModelNames(tc.requested, candidates), tc.requested)
+	}
 }
 
 func TestSharedEndpointRebindsToSelectedType61Plugin(t *testing.T) {
