@@ -69,7 +69,12 @@ import {
   resolveTaskPreviewMode,
   shouldLoadTaskArtifacts,
 } from '../lib/task-artifacts'
-import type { TaskArtifact, TaskArtifactType, TaskLog } from '../types'
+import type {
+  TaskArtifact,
+  TaskArtifactProjection,
+  TaskArtifactType,
+  TaskLog,
+} from '../types'
 import { AudioPreviewDialog } from './dialogs/audio-preview-dialog'
 
 function artifactIcon(type: TaskArtifactType) {
@@ -299,7 +304,7 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
 interface TaskArtifactsProps {
   taskId: string
   enabled: boolean
-  emptyContent?: (legacyContentUrl?: string) => React.ReactNode
+  emptyContent?: (projection: TaskArtifactProjection) => React.ReactNode
 }
 
 function TaskArtifacts(props: TaskArtifactsProps) {
@@ -354,11 +359,7 @@ function TaskArtifacts(props: TaskArtifactsProps) {
   }
 
   if (artifactsQuery.data.artifacts.length === 0) {
-    return (
-      props.emptyContent?.(artifactsQuery.data.legacyContentUrl) ?? (
-        <EmptyTaskArtifacts />
-      )
-    )
+    return props.emptyContent?.(artifactsQuery.data) ?? <EmptyTaskArtifacts />
   }
 
   return (
@@ -390,11 +391,24 @@ function EmptyTaskArtifacts() {
   )
 }
 
-function LegacyTaskArtifacts(props: { legacyContentUrl?: string }) {
-  if (props.legacyContentUrl) {
-    return <LegacyVideoMedia contentUrl={props.legacyContentUrl} />
-  }
-  return <EmptyTaskArtifacts />
+// A non-plugin task exposes one result URL. The server detects whether it is
+// an image or a video (image models are also submitted as video tasks); older
+// servers omit the type, and those results were always videos.
+function LegacyTaskArtifacts(props: { projection: TaskArtifactProjection }) {
+  const { legacyContentUrl, legacyContentType, legacyMimeType } =
+    props.projection
+  if (!legacyContentUrl) return <EmptyTaskArtifacts />
+  const type = legacyContentType ?? 'video'
+  return (
+    <TaskArtifactCard
+      artifact={{
+        key: type,
+        type,
+        mime_type: legacyMimeType,
+        content_url: legacyContentUrl,
+      }}
+    />
+  )
 }
 
 export function TaskArtifactsCell(props: { log: TaskLog }) {
@@ -437,7 +451,7 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
           className='text-foreground text-xs hover:underline'
           onClick={() => setOpen(true)}
         >
-          {t('Click to preview video')}
+          {t('Preview')}
         </button>
       ) : (
         <Button
@@ -481,38 +495,11 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
         <TaskArtifacts
           taskId={props.log.task_id}
           enabled={shouldLoadTaskArtifacts(props.log, open)}
-          emptyContent={(legacyContentUrl) => (
-            <LegacyTaskArtifacts legacyContentUrl={legacyContentUrl} />
+          emptyContent={(projection) => (
+            <LegacyTaskArtifacts projection={projection} />
           )}
         />
       </Dialog>
     </>
-  )
-}
-
-interface LegacyVideoMediaProps {
-  contentUrl: string
-}
-
-function LegacyVideoMedia(props: LegacyVideoMediaProps) {
-  const [mediaFailed, setMediaFailed] = useState(false)
-  const [mediaRevision, setMediaRevision] = useState(0)
-
-  return mediaFailed ? (
-    <MediaFailure
-      onRetry={() => {
-        setMediaFailed(false)
-        setMediaRevision((revision) => revision + 1)
-      }}
-    />
-  ) : (
-    <video
-      key={mediaRevision}
-      src={props.contentUrl}
-      controls
-      preload='metadata'
-      className='max-h-[60vh] w-full rounded-md bg-black'
-      onError={() => setMediaFailed(true)}
-    />
   )
 }

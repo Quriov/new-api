@@ -122,6 +122,13 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 			return
 		}
 		response["legacy_content_url"] = legacyContentURL
+		// Image models are also submitted through the video endpoints, so the
+		// action alone cannot tell the preview kind; detect it from the content.
+		media := resolveLegacyTaskMedia(c, task)
+		response["legacy_content_type"] = media.Type
+		if media.MimeType != "" {
+			response["legacy_mime_type"] = media.MimeType
+		}
 	}
 	if dashboard {
 		common.ApiSuccess(c, response)
