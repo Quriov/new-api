@@ -397,9 +397,15 @@ export interface AudioClip {
   }
 }
 
+// Media kind of a non-plugin task result, detected by the server from the
+// content itself because image models are also submitted as video tasks.
+export type LegacyTaskContentType = 'image' | 'video'
+
 export interface TaskArtifactProjection {
   artifacts: TaskArtifact[]
   legacyContentUrl?: string
+  legacyContentType?: LegacyTaskContentType
+  legacyMimeType?: string
   legacyAudioClips?: AudioClip[]
 }
 
@@ -410,6 +416,8 @@ export interface TaskArtifactsResponse {
   data?: {
     artifacts?: unknown
     legacy_content_url?: unknown
+    legacy_content_type?: unknown
+    legacy_mime_type?: unknown
     legacy_audio_clips?: unknown
   }
 }

@@ -108,6 +108,15 @@ function parseContentUrl(value: unknown): string {
   }
 }
 
+function parseMimeType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const mimeType = value.trim()
+  if (!mimeType || mimeType.length > 255 || /[\r\n]/.test(mimeType)) {
+    return undefined
+  }
+  return mimeType
+}
+
 function parseTaskArtifact(value: unknown): TaskArtifact {
   if (!isRecord(value)) {
     throw new TaskArtifactApiError('invalid_artifact')
@@ -192,6 +201,16 @@ export function parseTaskArtifactsResponse(
     projection.legacyContentUrl = parseContentUrl(
       response.data.legacy_content_url
     )
+    // Servers that predate content detection omit the type; the preview then
+    // keeps treating the legacy result as a video.
+    const legacyContentType = response.data.legacy_content_type
+    if (legacyContentType === 'image' || legacyContentType === 'video') {
+      projection.legacyContentType = legacyContentType
+    }
+    const legacyMimeType = parseMimeType(response.data.legacy_mime_type)
+    if (legacyMimeType) {
+      projection.legacyMimeType = legacyMimeType
+    }
   }
   if (response.data?.legacy_audio_clips != null) {
     projection.legacyAudioClips = parseLegacyAudioClips(
