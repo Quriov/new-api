@@ -175,6 +175,23 @@ func TestDashboardTaskArtifactsFallsBackToVideoWhenLegacyProbeFails(t *testing.T
 	assert.Equal(t, int32(2), hits.Load())
 }
 
+func TestDashboardTaskArtifactsDoesNotProbeDiscardedLegacyResult(t *testing.T) {
+	var hits atomic.Int32
+	upstream := newLegacyMediaUpstream(t, &hits, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusPartialContent)
+	})
+	task := setupLegacyMediaTask(t, upstream.URL)
+	task.PrivateData.ResultDiscarded = true
+	require.NoError(t, model.DB.Save(task).Error)
+
+	response, _ := requestDashboardLegacyArtifacts(t, task)
+
+	assert.Equal(t, "video", response.Data.LegacyContentType)
+	assert.Empty(t, response.Data.LegacyMimeType)
+	assert.Equal(t, int32(0), hits.Load())
+}
+
 func TestPublicTaskArtifactsReportsLegacyContentType(t *testing.T) {
 	var hits atomic.Int32
 	upstream := newLegacyMediaUpstream(t, &hits, func(w http.ResponseWriter) {

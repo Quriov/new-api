@@ -70,6 +70,11 @@ func storeLegacyTaskMediaCache(key string, media legacyTaskMedia) {
 // resolveLegacyTaskMedia reports whether a non-plugin task result is an image
 // or a video. Anything it cannot classify keeps the historical video preview.
 func resolveLegacyTaskMedia(c *gin.Context, task *model.Task) legacyTaskMedia {
+	// A discarded result is never served by the content endpoint, so there is
+	// nothing to preview and no reason to contact the upstream.
+	if !task.ResultRetrievable() {
+		return legacyTaskMedia{Type: legacyTaskMediaTypeVideo}
+	}
 	key := legacyTaskMediaCacheKey(task)
 	if media, ok := loadLegacyTaskMediaCache(key); ok {
 		return media
