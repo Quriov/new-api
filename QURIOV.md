@@ -260,13 +260,15 @@ model 已换成上游名之后）调用上游现成的 `ApplyParamOverrideWithRe
 
 **测试**：`middleware/distributor_test.go` 的 `TestDistributeExplainsUnknownModelName`（真路由进 `Distribute`，
 内存缓存开 / 关两种各跑一遍：错名给出真名、`/v1/videos` 同样生效、无关名不乱猜、别的分组的型号不推荐、令牌不允许的型号不推荐、
-已知但渠道全禁用保持原文）+ `TestSuggestModelNames`（匹配规则表）；演练脚本加了一条「错名 → 503、报错里有真名、不转发、不扣费」。
+已知但渠道全禁用保持原文）+ `TestSuggestModelNames`（匹配规则表）。
+演练脚本**没加**这条断言：换镜像演练会拿旧生产镜像跑 `--phase full`，旧镜像没有这个修复必然红；
+等生产换上带它的镜像、`OLD_IMAGE` 改成新 tag 之后再加。
 
 ---
 
 ## 演练脚本与 CI（2026-09-29）
 
-`scripts/quriov-e2e/e2e.py` + `mock_upstream.py`：对跑着的 new-api 打真实 HTTP，核对改造 1–5 的行为（参数覆盖、
+`scripts/quriov-e2e/e2e.py` + `mock_upstream.py`：对跑着的 new-api 打真实 HTTP，核对改造 1–4 的行为（参数覆盖、
 字段透传、按次计价、`return_error` 拒单不扣费、换渠道重投只收一次钱、同步腿不进正常路由）。只连本机 mock，
 型号名和价格全是占位。
 
