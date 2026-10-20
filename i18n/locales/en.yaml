@@ -280,6 +280,8 @@ distributor.group_access_denied: "No permission to access this group"
 distributor.get_channel_failed: "Failed to get available channel for model {{.Model}} under group {{.Group}} (distributor): {{.Error}}"
 distributor.no_available_channel: "No available channel for model {{.Model}} under group {{.Group}} (distributor)"
 distributor.no_available_channel_task_plugin: "No available channel for model {{.Model}} under group {{.Group}}: the model is claimed by a task plugin, which has no enabled channel serving it (distributor)"
+distributor.model_not_found: "Model {{.Model}} does not exist under group {{.Group}}; check the model name, GET /v1/models lists the models you can use (distributor)"
+distributor.model_not_found_suggest: "Model {{.Model}} does not exist under group {{.Group}}. Did you mean {{.Suggestions}}? Model names must match exactly (distributor)"
 distributor.invalid_midjourney_request: "Invalid Midjourney request: {{.Error}}"
 distributor.invalid_request_parse_model: "Invalid request, unable to parse model"
 

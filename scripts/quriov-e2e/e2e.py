@@ -18,6 +18,7 @@ phase=smoke ：用 state 里的账号和令牌登录、提交一单、等它完�
   - sora 插件接未认领型号时丢字段（aspect_ratio 等）、按视频尺寸枚举拒图片尺寸（改造 4）
   - TASK_PRICE_PATCH 型号被上游内置 token 表达式接管后扣 0（改造 4）
   - 任务失败换渠道重投、只收一次钱、同步腿不进正常路由（改造 1、2）
+  - 型号名写错（少连字符、大小写不对）时报错里给出正确型号名，不转发、不扣费（改造 5）
 """
 import argparse
 import json
@@ -244,6 +245,13 @@ def main():
 
             s = submit(api, cfg["tier2k_model"], "bad ratio", aspect_ratio="4:3")
             check("return_error: rejected before upstream, not charged", s["http"] >= 400 and not s["upstream"] and s["charged"] == 0,
+                  {"http": s["http"], "resp": s["resp"], "charged": s["charged"]})
+
+            typo = cfg["tier2k_model"].replace("-2K", "2k")
+            s = submit(api, typo, "typo in the model name")
+            err = (s["resp"].get("error") or {}) if isinstance(s["resp"], dict) else {}
+            check("mistyped model name: error names the real model, nothing sent upstream, not charged",
+                  s["http"] == 503 and cfg["tier2k_model"] in str(err.get("message")) and not s["upstream"] and s["charged"] == 0,
                   {"http": s["http"], "resp": s["resp"], "charged": s["charged"]})
 
             s = submit(api, cfg["plain_model"], "plain", aspect_ratio="9:16", images=["https://ref.mock.invalid/a.png"])

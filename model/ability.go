@@ -47,6 +47,24 @@ func GetGroupEnabledModels(group string) []string {
 	return models
 }
 
+// GetGroupModelAvailability maps every model name declared by any channel of
+// group, including currently disabled channels, to whether at least one
+// enabled channel serves it. A name missing from the map is unknown to the
+// group, as opposed to temporarily unserved.
+func GetGroupModelAvailability(group string) (map[string]bool, error) {
+	var rows []Ability
+	// A map condition lets GORM quote the reserved "group" column per dialect.
+	err := DB.Model(&Ability{}).Select("model", "enabled").Where(map[string]any{"group": group}).Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	availability := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		availability[row.Model] = availability[row.Model] || row.Enabled
+	}
+	return availability, nil
+}
+
 func GetEnabledModels() []string {
 	var models []string
 	// Find distinct models
