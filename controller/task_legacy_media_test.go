@@ -37,15 +37,15 @@ func setupLegacyMediaTask(t *testing.T, upstreamURL string) *model.Task {
 	previousPublicAddress := system_setting.TaskPublicAddress
 	common.CryptoSecret = "controller-task-legacy-media-secret"
 	system_setting.TaskPublicAddress = "https://gateway.example"
-	legacyTaskMediaCache.Lock()
-	legacyTaskMediaCache.items = make(map[string]legacyTaskMedia)
-	legacyTaskMediaCache.Unlock()
+	taskResultMediaCache.Lock()
+	taskResultMediaCache.items = make(map[string]taskResultMedia)
+	taskResultMediaCache.Unlock()
 	t.Cleanup(func() {
 		common.CryptoSecret = previousSecret
 		system_setting.TaskPublicAddress = previousPublicAddress
-		legacyTaskMediaCache.Lock()
-		legacyTaskMediaCache.items = make(map[string]legacyTaskMedia)
-		legacyTaskMediaCache.Unlock()
+		taskResultMediaCache.Lock()
+		taskResultMediaCache.items = make(map[string]taskResultMedia)
+		taskResultMediaCache.Unlock()
 	})
 	allowPrivateTaskMediaTest(t)
 	// Image models are submitted through POST /v1/videos, so a successful image
@@ -224,27 +224,27 @@ func TestLegacyTaskMediaClassification(t *testing.T) {
 	cases := []struct {
 		name        string
 		contentType string
-		want        legacyTaskMedia
+		want        taskResultMedia
 	}{
-		{"image with parameters", "image/png; charset=binary", legacyTaskMedia{Type: "image", MimeType: "image/png"}},
-		{"video", "video/webm", legacyTaskMedia{Type: "video", MimeType: "video/webm"}},
-		{"generic", "application/octet-stream", legacyTaskMedia{}},
-		{"empty", "", legacyTaskMedia{}},
-		{"malformed", "image/png\r\nX-Injected: 1", legacyTaskMedia{}},
+		{"image with parameters", "image/png; charset=binary", taskResultMedia{Type: "image", MimeType: "image/png"}},
+		{"video", "video/webm", taskResultMedia{Type: "video", MimeType: "video/webm"}},
+		{"generic", "application/octet-stream", taskResultMedia{}},
+		{"empty", "", taskResultMedia{}},
+		{"malformed", "image/png\r\nX-Injected: 1", taskResultMedia{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, legacyTaskMediaFromContentType(tc.contentType))
+			assert.Equal(t, tc.want, taskResultMediaFromContentType(tc.contentType))
 		})
 	}
 
 	assert.Equal(t,
-		legacyTaskMedia{Type: "image", MimeType: "image/jpeg"},
-		legacyTaskMediaFromDataURL("data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString([]byte("x"))),
+		taskResultMedia{Type: "image", MimeType: "image/jpeg"},
+		taskResultMediaFromDataURL("data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString([]byte("x"))),
 	)
 	assert.Equal(t,
-		legacyTaskMedia{Type: "image", MimeType: "image/png"},
-		legacyTaskMediaFromDataURL("data:;base64,"+base64.StdEncoding.EncodeToString(pngHeader)),
+		taskResultMedia{Type: "image", MimeType: "image/png"},
+		taskResultMediaFromDataURL("data:;base64,"+base64.StdEncoding.EncodeToString(pngHeader)),
 	)
-	assert.Equal(t, legacyTaskMedia{}, legacyTaskMediaFromDataURL("data:,plain"))
+	assert.Equal(t, taskResultMedia{}, taskResultMediaFromDataURL("data:,plain"))
 }

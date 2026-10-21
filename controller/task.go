@@ -98,18 +98,30 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 		return
 	}
 	items := make([]taskArtifactResponse, 0, len(artifacts))
+	probed := 0
 	for _, artifact := range artifacts {
 		contentURL, buildErr := service.BuildTaskArtifactContentURL(task.TaskID, artifact.Key)
 		if buildErr != nil {
 			writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_url_error", "Failed to build artifact content URL")
 			return
 		}
-		items = append(items, taskArtifactResponse{
+		item := taskArtifactResponse{
 			Key:        artifact.Key,
 			Type:       artifact.Type,
 			MimeType:   artifact.MimeType,
 			ContentURL: contentURL,
-		})
+		}
+		// Plugins such as sora list every result as an untyped video, though
+		// image models return images through the same endpoints. Detect the
+		// real kind from the content; the key and content URL stay the same.
+		if pluginArtifactNeedsMediaProbe(artifact) && probed < maxProbedTaskArtifacts {
+			probed++
+			if media := resolveTaskResultMedia(c, task, artifact.Key); media.isImage() {
+				item.Type = media.Type
+				item.MimeType = media.MimeType
+			}
+		}
+		items = append(items, item)
 	}
 	response := gin.H{"task_id": task.TaskID, "artifacts": items}
 	if dashboard && task.Status == model.TaskStatusSuccess && task.Platform == constant.TaskPlatformSuno {
@@ -124,7 +136,7 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 		response["legacy_content_url"] = legacyContentURL
 		// Image models are also submitted through the video endpoints, so the
 		// action alone cannot tell the preview kind; detect it from the content.
-		media := resolveLegacyTaskMedia(c, task)
+		media := resolveTaskResultMedia(c, task, "video")
 		response["legacy_content_type"] = media.Type
 		if media.MimeType != "" {
 			response["legacy_mime_type"] = media.MimeType
@@ -360,9 +372,11 @@ func TaskArtifactContent(c *gin.Context) {
 		return
 	}
 	found := false
+	var projected relaychannel.TaskArtifact
 	for _, artifact := range artifacts {
 		if artifact.Key == artifactKey {
 			found = true
+			projected = artifact
 			break
 		}
 	}
@@ -395,7 +409,19 @@ func TaskArtifactContent(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_plugin_error", "Artifact content plugin failed")
 		return
 	}
-	if err := proxyTaskMedia(c, task, descriptor); err != nil {
+	// An untyped video artifact that is really an image is often served as
+	// application/octet-stream; label it so <img> renders under nosniff. The
+	// classification is only consulted when the upstream type is generic.
+	var imageMimeType func() string
+	if pluginArtifactNeedsMediaProbe(projected) {
+		imageMimeType = func() string {
+			if media := resolveTaskResultMedia(c, task, artifactKey); media.isImage() {
+				return media.MimeType
+			}
+			return ""
+		}
+	}
+	if err := proxyTaskMediaWithImageType(c, task, descriptor, imageMimeType); err != nil {
 		writeTaskMediaProxyError(c, err)
 	}
 }
