@@ -130,6 +130,19 @@ func VideoProxy(c *gin.Context) {
 }
 
 func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.TaskContentRequest) error {
+	return proxyTaskMediaWithImageType(c, task, descriptor, nil)
+}
+
+// proxyTaskMediaWithImageType proxies task media like proxyTaskMedia. When the
+// upstream Content-Type is missing or generic, imageMimeType (if set) is asked
+// for the detected image type of the content, which then replaces it. Specific
+// upstream types are always kept, and an empty answer changes nothing.
+func proxyTaskMediaWithImageType(
+	c *gin.Context,
+	task *model.Task,
+	descriptor *relaychannel.TaskContentRequest,
+	imageMimeType func() string,
+) error {
 	if descriptor == nil {
 		return &taskMediaProxyError{
 			status: http.StatusInternalServerError, code: "artifact_plugin_error",
@@ -163,7 +176,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		return err
 	}
 	defer resp.Body.Close()
-	return writeTaskMediaResponse(c, resp)
+	return writeTaskMediaResponse(c, resp, imageMimeType)
 }
 
 // openTaskMedia validates a non-data task content descriptor and sends it
@@ -301,10 +314,18 @@ func openTaskMedia(
 
 // writeTaskMediaResponse streams an upstream task media response to the client
 // or maps its status to a stable artifact error.
-func writeTaskMediaResponse(c *gin.Context, resp *http.Response) error {
+func writeTaskMediaResponse(c *gin.Context, resp *http.Response, imageMimeType func() string) error {
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent, http.StatusNotModified, http.StatusRequestedRangeNotSatisfiable:
 		copyTaskMediaResponseHeaders(c.Writer.Header(), resp.Header)
+		if imageMimeType != nil &&
+			(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) &&
+			isGenericTaskMediaContentType(resp.Header.Get("Content-Type")) {
+			if detected := imageMimeType(); strings.HasPrefix(detected, "image/") &&
+				len(detected) <= 255 && httpguts.ValidHeaderFieldValue(detected) {
+				c.Writer.Header().Set("Content-Type", detected)
+			}
+		}
 		setTaskMediaResponseSecurityHeaders(c.Writer.Header())
 		c.Status(resp.StatusCode)
 		c.Writer.WriteHeaderNow()
