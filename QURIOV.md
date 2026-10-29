@@ -264,6 +264,23 @@ model 已换成上游名之后）调用上游现成的 `ApplyParamOverrideWithRe
 演练脚本**没加**这条断言：换镜像演练会拿旧生产镜像跑 `--phase full`，旧镜像没有这个修复必然红；
 等生产换上带它的镜像、`OLD_IMAGE` 改成新 tag 之后再加。
 
+### 6. 插件在请求阶段拒单时，客户只看到插件写的那句话（2026-10-30）
+
+**治的问题**：sora 插件（渠道类型 1，旧式路由）在 `buildSubmitRequest` 里拒单时，客户拿到的 message 是
+「plugin sora@1.1.0-quriov.2 hook buildSubmitRequest failed: Error: <插件那句话> at quriovRejectMultiImage (sora.js:535:108(96))」——
+露出插件名、版本、钩子名、文件名和行号。同一句话走插件路由（async-image-relay，渠道类型 61）时是干净的：
+那条路在协议解码阶段拒，`middleware/task_plugin.go` 的 `taskPluginHookDetail` 只取 `HookError.Message`。
+
+**做了什么**：`ValidateRequestAndSetAction` 里 `buildSubmit` 失败时，若错误是 `HookError`（插件抛出的 JS 异常），
+客户可见的 message 换成 `HookError.Message`（引擎已截断 512 字、去控制字符，这里再 trim）；为空退回「请求参数不符合该型号要求」。
+完整原文（带前缀与栈）留在 `TaskError.Error`，并打一条 `event=request_rejected` 的 warn 日志。HTTP 400 与 `plugin_request_invalid` 不变。
+
+**刻意不做的**：超时 / 中断（不是 `HookError`）保持原样；插件 bug（TypeError 等）也是 `HookError`，客户看到异常文本本身，
+不再带前缀和栈——比以前少露，不多露。`plugin_usage_invalid` 两处没动。
+
+**碰了哪些文件**：`relay/channel/task/jsplugin/adaptor.go`（一行）、`quriov_plugin_reject.go`（判据）、`quriov_plugin_reject_test.go`
+（真插件引擎：Error / 首尾空白 / 空 message / TypeError 四种；变异：改回旧写法测试变红）。
+
 ---
 
 ## 演练脚本与 CI（2026-09-29）
