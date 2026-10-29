@@ -138,7 +138,8 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	if _, err := a.buildSubmit(c, info); err != nil {
-		return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+		// Quriov 改造 6：客户只看插件写的那句话，完整原文进日志（见 quriov_plugin_reject.go）。
+		return quriovPluginRequestInvalid(c, a.plugin.Meta.Key, err)
 	}
 	// The descriptor may rewrite the model. Validate profiled requests against
 	// that final model before any quota calculation or upstream submission; an
