@@ -383,3 +383,31 @@ func TestInitChannelMetaResetsPerAttemptStreamStateAndPreservesRequestState(t *t
 func ptr[T any](value T) *T {
 	return &value
 }
+
+func TestTaskSubmitReqSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, want string
+		invalid         bool
+	}{
+		{"integer", `{"seconds":5}`, "5", false},
+		{"whole_float", `{"seconds":5.0}`, "5", false},
+		{"fraction", `{"seconds":2.5}`, "2.5", false},
+		{"string", `{"seconds":"5"}`, "5", false},
+		{"missing", `{}`, "", false},
+		{"null", `{"seconds":null}`, "", false},
+		{"boolean", `{"seconds":true}`, "", true},
+		{"object", `{"seconds":{}}`, "", true},
+		{"array", `{"seconds":[]}`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var req TaskSubmitReq
+			err := common.Unmarshal([]byte(tc.raw), &req)
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, req.Seconds)
+		})
+	}
+}
