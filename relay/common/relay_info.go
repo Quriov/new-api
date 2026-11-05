@@ -1016,6 +1016,7 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 	aux := &struct {
 		Metadata json.RawMessage `json:"metadata,omitempty"`
 		Duration json.RawMessage `json:"duration,omitempty"`
+		Seconds  json.RawMessage `json:"seconds,omitempty"`
 		*Alias
 	}{
 		Alias: (*Alias)(t),
@@ -1023,6 +1024,19 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 
 	if err := common.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+
+	if len(aux.Seconds) > 0 {
+		var secondsStr string
+		if err := common.Unmarshal(aux.Seconds, &secondsStr); err == nil {
+			t.Seconds = secondsStr
+		} else {
+			var secondsNum float64
+			if err := common.Unmarshal(aux.Seconds, &secondsNum); err != nil {
+				return err
+			}
+			t.Seconds = strconv.FormatFloat(secondsNum, 'f', -1, 64)
+		}
 	}
 
 	if len(aux.Duration) > 0 {
